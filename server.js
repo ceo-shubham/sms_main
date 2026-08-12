@@ -12,7 +12,9 @@ const PUBLIC_DIR = path.join(__dirname, 'public');
 
 const db = initDb();
 const sessions = new Map(); // token -> { userId, lastActive }
-backup.startAutoBackup(db, 60000);
+// Local-dev only: periodic CSV backups. On Vercel (serverless) timers + local disk
+// don't apply — backups are pushed to B2 instead (see backup.js).
+if (require.main === module) backup.startAutoBackup(db, 60000);
 
 // ---------------------------------------------------------------------------
 // helpers
@@ -1506,7 +1508,9 @@ function serveStatic(req, res, pathname) {
 // ---------------------------------------------------------------------------
 // server
 // ---------------------------------------------------------------------------
-const server = http.createServer(async (req, res) => {
+// Request handler shared by the local HTTP server AND the Vercel serverless
+// function (api/index.js). Vercel calls it with the same (req, res) pair.
+async function handleRequest(req, res) {
   const pathname = req.url.split('?')[0];
   try {
     if (pathname.startsWith('/api/')) {
@@ -1534,14 +1538,23 @@ const server = http.createServer(async (req, res) => {
     console.error('Server error:', e);
     if (!res.writableEnded) fail(res, 500, 'Server error');
   }
-});
+}
 
-server.listen(PORT, () => {
-  const s = getSettings();
-  console.log(`\n🏫 ${s.school.name} — School Management System`);
-  console.log(`   http://localhost:${PORT}`);
-  console.log(`   Admin:  admin / admin@123`);
-  console.log(`   Manager: manager / manager@123`);
-  console.log(`   Staff/Teacher: <employee code> / <code>@123   |   Parent: <admission no> / <admission no>@123`);
-  console.log(`   Backups → backups/<date>/ every minute when data changes\n`);
-});
+const server = http.createServer(handleRequest);
+
+// Only bind the port when run directly (node server.js). When imported as a
+// module (e.g. by the Vercel serverless function) the handler is exported instead.
+if (require.main === module) {
+  server.listen(PORT, () => {
+    const s = getSettings();
+    console.log(`\n🏫 ${s.school.name} — School Management System`);
+    console.log(`   http://localhost:${PORT}`);
+    console.log(`   Admin:  admin / admin@123`);
+    console.log(`   Manager: manager / manager@123`);
+    console.log(`   Staff/Teacher: <employee code> / <code>@123   |   Parent: <admission no> / <admission no>@123`);
+    console.log(`   Backups → backups/<date>/ every minute when data changes\n`);
+  });
+}
+
+module.exports = { handleRequest, server };
+
