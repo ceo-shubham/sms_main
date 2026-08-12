@@ -323,29 +323,82 @@ async function bootstrapDb(db) {
   console.log('✅ Fresh database seeded (admin / admin@123, manager / manager@123)');
 }
 
+// Minimal Turso client over its HTTP API (v2 pipeline) using only built-in
+// fetch. No native bindings, no ws/node-fetch — near-zero module load cost,
+// so Vercel cold starts are fast.
 function initTurso({ url, authToken }) {
-  // Use the pure-JS HTTP transport (no native bindings) so this works on
-  // serverless runtimes like Vercel. libsql:// -> https://
-  const { createClient } = require('@libsql/client/http');
   const httpUrl = url.replace(/^libsql:/, 'https:');
-  const client = createClient({ url: httpUrl, authToken });
+  const enc = (a) => {
+    if (a === null || a === undefined) return { type: 'null', value: null };
+    if (typeof a === 'number') return Number.isInteger(a) ? { type: 'integer', value: String(a) } : { type: 'float', value: String(a) };
+    if (typeof a === 'boolean') return { type: 'integer', value: a ? '1' : '0' };
+    return { type: 'text', value: String(a) };
+  };
+  const dec = (v) => {
+    if (!v) return null;
+    switch (v.type) {
+      case 'integer': return Number(v.value);
+      case 'float': return Number(v.value);
+      case 'text': return v.value;
+      case 'null': return null;
+      default: return v.value;
+    }
+  };
+  const stmt = (sql, args) => ({ sql, args: (args || []).map(enc) });
+  // Runs a v2 pipeline; returns the array of step results ({cols, rows, affected_row_count, last_insert_rowid}).
+  async function pipeline(requests) {
+    const res = await fetch(httpUrl + '/v2/pipeline', {
+      method: 'POST',
+      headers: { Authorization: 'Bearer ' + authToken, 'Content-Type': 'application/json' },
+      body: JSON.stringify({ requests })
+    });
+    if (!res.ok) {
+      let msg = 'Turso HTTP ' + res.status;
+      try { const j = await res.json(); if (j && j.error) msg = j.error; } catch { /* keep default */ }
+      throw new Error(msg);
+    }
+    const j = await res.json();
+    const out = [];
+    for (const r of (j.results || [])) {
+      if (r.type !== 'ok' || !r.response) throw new Error((r.error) || 'Turso request failed');
+      if (r.response.type === 'execute') {
+        out.push(r.response.result);
+      } else if (r.response.type === 'batch' && r.response.result) {
+        out.push(...r.response.result.step_results);
+      }
+    }
+    return out;
+  }
+  const rowsOf = (result) => {
+    const cols = (result && result.cols || []).map(c => c.name);
+    return (result && result.rows || []).map(row => {
+      const o = {};
+      cols.forEach((c, i) => { o[c] = dec(row[i]); });
+      return o;
+    });
+  };
   return {
     backend: 'turso',
     prepare(sql) {
       return {
-        get: async (...args) => (await client.execute({ sql, args })).rows[0],
-        all: async (...args) => (await client.execute({ sql, args })).rows,
+        get: async (...args) => rowsOf((await pipeline([{ type: 'execute', stmt: stmt(sql, args) }]))[0])[0],
+        all: async (...args) => rowsOf((await pipeline([{ type: 'execute', stmt: stmt(sql, args) }]))[0]),
         run: async (...args) => {
-          const r = await client.execute({ sql, args });
-          return { changes: Number(r.rowsAffected ?? 0), lastInsertRowid: Number(r.lastInsertRowid ?? 0) };
+          const r = (await pipeline([{ type: 'execute', stmt: stmt(sql, args) }]))[0];
+          return { changes: Number(r.affected_row_count || 0), lastInsertRowid: Number(r.last_insert_rowid || 0) };
         }
       };
     },
-    exec: async (sql) => { await client.executeMultiple(sql); },
+    exec: async (sql) => {
+      const stmts = sql.split(';').map(s => s.trim()).filter(Boolean);
+      await pipeline(stmts.map(s => ({ type: 'execute', stmt: { sql: s, args: [] } })));
+    },
+    // Runs a batch in a single HTTP round trip; Turso wraps it in an implicit
+    // transaction (all steps commit or none do).
     async batch(statements) {
-      const results = await client.batch(statements.map(s => ({ sql: s.sql, args: s.args || [] })), 'write');
-      const last = results && results.length ? results[results.length - 1] : null;
-      return { changes: Number(last ? last.rowsAffected : 0), lastInsertRowid: Number(last ? (last.lastInsertRowid ?? 0) : 0) };
+      const results = await pipeline([{ type: 'batch', batch: { steps: statements.map(s => ({ type: 'execute', stmt: stmt(s.sql, s.args) })) } }]);
+      const last = results.length ? results[results.length - 1] : null;
+      return { changes: Number(last ? last.affected_row_count : 0), lastInsertRowid: Number(last ? (last.last_insert_rowid || 0) : 0) };
     },
     close: async () => {}
   };
