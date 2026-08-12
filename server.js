@@ -1514,9 +1514,9 @@ function serveStatic(req, res, pathname) {
 // Request handler shared by the local HTTP server AND the Vercel serverless
 // function (api/index.js). Vercel calls it with the same (req, res) pair.
 async function handleRequest(req, res) {
-  await ensureDb();
   const pathname = req.url.split('?')[0];
   try {
+    await ensureDb();
     if (pathname.startsWith('/api/')) {
       const parts = pathname.split('/').filter(Boolean);
       let handled = false;

@@ -1,9 +1,12 @@
 // db.js — SQLite schema + minimal bootstrap seed for the School Management System
 'use strict';
-const { DatabaseSync } = require('node:sqlite');
 const crypto = require('node:crypto');
 const fs = require('node:fs');
 const path = require('node:path');
+
+// NOTE: node:sqlite is NOT required at module load. It is only available on
+// some runtimes (local Node >= 22.5 with the flag; NOT on Vercel), so we load
+// it lazily inside initDb() — the Turso backend never touches it.
 
 const DATA_DIR = path.join(__dirname, 'data');
 if (!fs.existsSync(DATA_DIR)) fs.mkdirSync(DATA_DIR, { recursive: true });
@@ -241,6 +244,7 @@ function migrate(db) {
 }
 
 function initDb() {
+  const { DatabaseSync } = require('node:sqlite'); // lazy: only for local dev
   const sqlite = new DatabaseSync(DB_PATH);
   sqlite.exec('PRAGMA journal_mode = WAL;');
   sqlite.exec(SCHEMA);
@@ -374,8 +378,11 @@ async function bootstrapDb(db) {
 }
 
 function initTurso({ url, authToken }) {
-  const { createClient } = require('@libsql/client');
-  const client = createClient({ url, authToken });
+  // Use the pure-JS HTTP transport (no native bindings) so this works on
+  // serverless runtimes like Vercel. libsql:// -> https://
+  const { createClient } = require('@libsql/client/http');
+  const httpUrl = url.replace(/^libsql:/, 'https:');
+  const client = createClient({ url: httpUrl, authToken });
   return {
     backend: 'turso',
     prepare(sql) {
