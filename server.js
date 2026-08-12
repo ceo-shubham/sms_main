@@ -328,36 +328,71 @@ route('GET', '/api/dashboard', async (req, res) => {
   if (!user) return;
   if (user.role === 'parent') return ok(res, { parentPortal: true });
   const today = todayStr();
-  const stats = {
-    totalStudents: (await db.prepare("SELECT COUNT(*) c FROM students WHERE status='active'").get()).c,
-    totalStaff: (await db.prepare("SELECT COUNT(*) c FROM employees WHERE status='active'").get()).c,
-    totalCollected: (await db.prepare('SELECT COALESCE(SUM(amount),0) s FROM payments').get()).s,
-    totalRoutes: (await db.prepare('SELECT COUNT(*) c FROM routes').get()).c,
-    todayStudents: (await db.prepare("SELECT COUNT(*) c FROM attendance WHERE date=? AND kind='student'").get(today)).c,
-    todayStaff: (await db.prepare("SELECT COUNT(*) c FROM attendance WHERE date=? AND kind='employee'").get(today)).c,
-    todayPresentStudents: (await db.prepare("SELECT COUNT(*) c FROM attendance WHERE date=? AND kind='student' AND status IN ('present','late')").get(today)).c,
-    todayPresentStaff: (await db.prepare("SELECT COUNT(*) c FROM attendance WHERE date=? AND kind='employee' AND status IN ('present','late')").get(today)).c,
-    studentsOnBus: (await db.prepare("SELECT COUNT(*) c FROM students WHERE route_id IS NOT NULL AND status='active'").get()).c,
-    pendingSalaries: (await db.prepare("SELECT COUNT(*) c FROM salaries WHERE status='pending'").get()).c
-  };
-  const monthly = (await db.prepare("SELECT strftime('%Y-%m',date) m, SUM(amount) total FROM payments GROUP BY m ORDER BY m DESC LIMIT 12").all()).reverse();
-  const gender = await db.prepare("SELECT gender, COUNT(*) c FROM students WHERE status='active' GROUP BY gender").all();
-  const classStrength = await db.prepare("SELECT class, section, COUNT(*) c FROM students WHERE status='active' GROUP BY class, section ORDER BY class, section").all();
+  // All dashboard queries are independent — fire them in PARALLEL so the total
+  // is one network round-trip worth of latency, not ~30 sequential ones.
   const trendDays = 7;
-  const trend = [];
-  const denomS = Math.max((await db.prepare("SELECT COUNT(*) c FROM students WHERE status='active'").get()).c, 1);
-  const denomE = Math.max((await db.prepare("SELECT COUNT(*) c FROM employees WHERE status='active'").get()).c, 1);
+  const trendDates = [];
   for (let i = trendDays - 1; i >= 0; i--) {
     const d = new Date(); d.setDate(d.getDate() - i);
-    const ds = `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}-${String(d.getDate()).padStart(2, '0')}`;
-    const s = await db.prepare("SELECT status, COUNT(*) c FROM attendance WHERE date=? AND kind='student' GROUP BY status").all(ds);
-    const e = await db.prepare("SELECT status, COUNT(*) c FROM attendance WHERE date=? AND kind='employee' GROUP BY status").all(ds);
-    const sum = (rows) => rows.filter(r => ['present', 'late'].includes(r.status)).reduce((a, r) => a + r.c, 0);
-    trend.push({ date: ds, label: ds.slice(5), studentsPct: Math.round(sum(s) / denomS * 100), staffPct: Math.round(sum(e) / denomE * 100) });
+    trendDates.push(`${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}-${String(d.getDate()).padStart(2, '0')}`);
   }
-  const notifs = (await db.prepare('SELECT * FROM notifications ORDER BY id DESC LIMIT 5').all()).filter(n => audienceMatches(n.audience, user.role));
-  const exams = await db.prepare('SELECT * FROM exams WHERE start_date >= ? ORDER BY start_date LIMIT 5').all(today);
-  const recentAdmissions = await db.prepare("SELECT id, name, admission_no, class, section, created_at FROM students WHERE status='active' ORDER BY id DESC LIMIT 6").all();
+  const Q = (sql, ...args) => db.prepare(sql).get(...args);
+  const QA = (sql, ...args) => db.prepare(sql).all(...args);
+  const [
+    rTotalStudents, rTotalStaff, rCollected, rRoutes, rTStu, rTStaff,
+    rTPStu, rTPStaff, rBus, rSal, rMonthly, rGender, rClass, rDenomS, rDenomE,
+    ...rTrend
+  ] = await Promise.all([
+    Q("SELECT COUNT(*) c FROM students WHERE status='active'"),
+    Q("SELECT COUNT(*) c FROM employees WHERE status='active'"),
+    Q('SELECT COALESCE(SUM(amount),0) s FROM payments'),
+    Q('SELECT COUNT(*) c FROM routes'),
+    Q("SELECT COUNT(*) c FROM attendance WHERE date=? AND kind='student'", today),
+    Q("SELECT COUNT(*) c FROM attendance WHERE date=? AND kind='employee'", today),
+    Q("SELECT COUNT(*) c FROM attendance WHERE date=? AND kind='student' AND status IN ('present','late')", today),
+    Q("SELECT COUNT(*) c FROM attendance WHERE date=? AND kind='employee' AND status IN ('present','late')", today),
+    Q("SELECT COUNT(*) c FROM students WHERE route_id IS NOT NULL AND status='active'"),
+    Q("SELECT COUNT(*) c FROM salaries WHERE status='pending'"),
+    QA("SELECT strftime('%Y-%m',date) m, SUM(amount) total FROM payments GROUP BY m ORDER BY m DESC LIMIT 12"),
+    QA("SELECT gender, COUNT(*) c FROM students WHERE status='active' GROUP BY gender"),
+    QA("SELECT class, section, COUNT(*) c FROM students WHERE status='active' GROUP BY class, section ORDER BY class, section"),
+    Q("SELECT COUNT(*) c FROM students WHERE status='active'"),
+    Q("SELECT COUNT(*) c FROM employees WHERE status='active'"),
+    ...trendDates.flatMap(ds => [
+      QA("SELECT status, COUNT(*) c FROM attendance WHERE date=? AND kind='student' GROUP BY status", ds),
+      QA("SELECT status, COUNT(*) c FROM attendance WHERE date=? AND kind='employee' GROUP BY status", ds)
+    ]),
+    QA('SELECT * FROM notifications ORDER BY id DESC LIMIT 5'),
+    QA('SELECT * FROM exams WHERE start_date >= ? ORDER BY start_date LIMIT 5', today),
+    QA("SELECT id, name, admission_no, class, section, created_at FROM students WHERE status='active' ORDER BY id DESC LIMIT 6")
+  ]);
+  const stats = {
+    totalStudents: (rTotalStudents || {}).c || 0,
+    totalStaff: (rTotalStaff || {}).c || 0,
+    totalCollected: (rCollected || {}).s || 0,
+    totalRoutes: (rRoutes || {}).c || 0,
+    todayStudents: (rTStu || {}).c || 0,
+    todayStaff: (rTStaff || {}).c || 0,
+    todayPresentStudents: (rTPStu || {}).c || 0,
+    todayPresentStaff: (rTPStaff || {}).c || 0,
+    studentsOnBus: (rBus || {}).c || 0,
+    pendingSalaries: (rSal || {}).c || 0
+  };
+  const monthly = (rMonthly || []).reverse();
+  const gender = rGender || [];
+  const classStrength = rClass || [];
+  const denomS = Math.max((rDenomS || {}).c || 0, 1);
+  const denomE = Math.max((rDenomE || {}).c || 0, 1);
+  const trend = [];
+  for (let i = 0; i < trendDays; i++) {
+    const s = rTrend[i * 2] || [];
+    const e = rTrend[i * 2 + 1] || [];
+    const sum = (rows) => rows.filter(x => ['present', 'late'].includes(x.status)).reduce((a, x) => a + x.c, 0);
+    trend.push({ date: trendDates[i], label: trendDates[i].slice(5), studentsPct: Math.round(sum(s) / denomS * 100), staffPct: Math.round(sum(e) / denomE * 100) });
+  }
+  const notifs = (rTrend[14] || []).filter(n => audienceMatches(n.audience, user.role));
+  const exams = rTrend[15] || [];
+  const recentAdmissions = rTrend[16] || [];
   ok(res, { stats, monthly, gender, classStrength, trend, notifications: notifs, upcomingExams: exams, recentAdmissions });
 });
 
