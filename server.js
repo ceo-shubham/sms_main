@@ -27,7 +27,32 @@ function ensureDb() {
   return dbReady;
 }
 
-const sessions = new Map(); // token -> { userId, lastActive }
+// ---- stateless sessions (serverless-safe) ----
+// Token = base64url(JSON{uid, exp}) . HMAC-SHA256(payload, SESSION_SECRET).
+// No server-side state, so it survives Vercel's per-request instances.
+// SESSION_SECRET must be set in production; locally we fall back to a random
+// per-process secret (fine for dev, but users get logged out on restart).
+const SESSION_SECRET = process.env.SESSION_SECRET || crypto.randomBytes(32).toString('hex');
+function signSession(userId, timeoutMin) {
+  const payload = Buffer.from(JSON.stringify({ uid: userId, exp: Date.now() + timeoutMin * 60000 })).toString('base64url');
+  const sig = crypto.createHmac('sha256', SESSION_SECRET).update(payload).digest('base64url');
+  return `${payload}.${sig}`;
+}
+function verifySession(token) {
+  if (!token || typeof token !== 'string') return null;
+  const i = token.lastIndexOf('.');
+  if (i < 0) return null;
+  const payload = token.slice(0, i);
+  const sig = token.slice(i + 1);
+  const expect = crypto.createHmac('sha256', SESSION_SECRET).update(payload).digest('base64url');
+  const a = Buffer.from(sig); const b = Buffer.from(expect);
+  if (a.length !== b.length || !crypto.timingSafeEqual(a, b)) return null;
+  try {
+    const data = JSON.parse(Buffer.from(payload, 'base64url').toString());
+    if (!data.uid || !data.exp || Date.now() > data.exp) return null;
+    return data;
+  } catch { return null; }
+}
 
 // ---------------------------------------------------------------------------
 // helpers
@@ -230,19 +255,17 @@ function audienceMatches(audience, role) {
 // ---------------------------------------------------------------------------
 async function auth(req, res, roles) {
   const token = (req.headers.authorization || '').replace(/^Bearer\s+/i, '') || (req.url.split('?')[0] && new URL(req.url, 'http://x').searchParams.get('token')) || '';
-  const sess = sessions.get(token);
+  const sess = verifySession(token);
   if (!sess) { fail(res, 401, 'Not authenticated'); return null; }
-  const user = await db.prepare('SELECT * FROM users WHERE id=?').get(sess.userId);
-  if (!user || user.status !== 'active') { sessions.delete(token); fail(res, 401, 'Account is not active'); return null; }
+  const user = await db.prepare('SELECT * FROM users WHERE id=?').get(sess.uid);
+  if (!user || user.status !== 'active') { fail(res, 401, 'Account is not active'); return null; }
+  // Sliding expiry: re-issue a fresh token when more than half the timeout is used.
   const settings = await getSettings();
   const timeoutMin = Number(settings.security.sessionTimeout) || 30;
-  const idle = (Date.now() - sess.lastActive) / 60000;
-  if (idle > timeoutMin) {
-    sessions.delete(token);
-    fail(res, 401, 'Session expired. Please log in again.');
-    return null;
+  const used = (Date.now() - (sess.exp - timeoutMin * 60000)) / 60000;
+  if (used > timeoutMin / 2 && !res.headersSent) {
+    res.setHeader('X-Session-Token', signSession(user.id, timeoutMin));
   }
-  sess.lastActive = Date.now();
   if (roles && !roles.includes(user.role)) { fail(res, 403, 'You do not have permission for this action'); return null; }
   req.user = user;
   req.token = token;
@@ -262,8 +285,9 @@ route('POST', '/api/auth/login', async (req, res) => {
     return;
   }
   if (user.status !== 'active') { fail(res, 403, 'Your account has been deactivated. Contact the administrator.'); return; }
-  const token = crypto.randomBytes(24).toString('hex');
-  sessions.set(token, { userId: user.id, lastActive: Date.now() });
+  const settings = await getSettings();
+  const timeoutMin = Number(settings.security.sessionTimeout) || 30;
+  const token = signSession(user.id, timeoutMin);
   await db.prepare('UPDATE users SET last_login=? WHERE id=?').run(todayStr(), user.id);
   const linked = await linkedName(user);
   ok(res, {
@@ -272,12 +296,11 @@ route('POST', '/api/auth/login', async (req, res) => {
       linked_id: user.linked_id, force_password_change: !!user.force_password_change, linked,
       last_login: user.last_login
     },
-    settings: await getSettings()
+    settings
   });
 });
 route('POST', '/api/auth/logout', async (req, res) => {
-  const token = (req.headers.authorization || '').replace(/^Bearer\s+/i, '');
-  sessions.delete(token);
+  // Stateless sessions: nothing to delete server-side, the client drops the token.
   ok(res, { ok: true });
 });
 route('GET', '/api/auth/me', async (req, res) => {

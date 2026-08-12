@@ -18,6 +18,9 @@ window.SMS = window.SMS || {};
     } catch (e) {
       throw new Error('Cannot reach the server. Is it running?');
     }
+    // Sliding session: server may hand back a refreshed token.
+    const refreshed = res.headers && res.headers.get('X-Session-Token');
+    if (refreshed) api.setToken(refreshed);
     let data = null;
     try { data = await res.json(); } catch (e) { /* no body */ }
     if (res.status === 401) {
