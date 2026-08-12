@@ -1540,7 +1540,7 @@ async function handleRequest(req, res) {
     if (!serveStatic(req, res, pathname)) fail(res, 404, 'Not found');
   } catch (e) {
     console.error('Server error:', e);
-    if (!res.writableEnded) fail(res, 500, 'Server error');
+    if (!res.writableEnded) fail(res, 500, e && e.message ? `Server error: ${e.message}` : 'Server error');
   }
 }
 
