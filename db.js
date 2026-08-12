@@ -8,8 +8,10 @@ const path = require('node:path');
 // some runtimes (local Node >= 22.5 with the flag; NOT on Vercel), so we load
 // it lazily inside initDb() — the Turso backend never touches it.
 
+// NOTE: no filesystem work at module load. Vercel's function directory is
+// read-only, so any mkdirSync/write here would crash the whole function even
+// when Turso is used. The data dir is created lazily inside initDb().
 const DATA_DIR = path.join(__dirname, 'data');
-if (!fs.existsSync(DATA_DIR)) fs.mkdirSync(DATA_DIR, { recursive: true });
 const DB_PATH = path.join(DATA_DIR, 'school.db');
 
 function hashPassword(password) {
@@ -245,6 +247,7 @@ function migrate(db) {
 
 function initDb() {
   const { DatabaseSync } = require('node:sqlite'); // lazy: only for local dev
+  if (!fs.existsSync(DATA_DIR)) fs.mkdirSync(DATA_DIR, { recursive: true });
   const sqlite = new DatabaseSync(DB_PATH);
   sqlite.exec('PRAGMA journal_mode = WAL;');
   sqlite.exec(SCHEMA);
