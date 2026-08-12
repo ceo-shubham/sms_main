@@ -6,6 +6,7 @@
 # runtime data (live SQLite DB + backups = real school data)
 data/
 backups/
+pre-migration-backup/
 server.log
 
 # tooling

@@ -264,4 +264,69 @@ function seedIfEmpty(db) {
   console.log('✅ Fresh database created (admin / admin@123, manager / manager@123)');
 }
 
-module.exports = { initDb, hashPassword, verifyPassword, DEFAULT_SETTINGS, DB_PATH };
+// ---------------------------------------------------------------------------
+// MongoDB backend — used on Vercel/serverless where SQLite's file storage can't
+// persist. The SQLite path above (initDb) remains for local development.
+// Docs keep the SAME field names as the SQLite tables (including the numeric
+// `id`) so the API response shapes are identical on both backends.
+// ---------------------------------------------------------------------------
+const dns = require('node:dns');
+const { MongoClient } = require('mongodb');
+
+const MONGO_DB_NAME = process.env.MONGO_DB_NAME || 'sms_main';
+
+// Some networks/sandboxes block Node's default DNS for SRV records while the OS
+// resolver works fine (Vercel is unaffected). Fall back to public resolvers only
+// when the default resolver refuses queries.
+async function ensureDns() {
+  try {
+    await dns.promises.resolveSrv('_mongodb._tcp.does-not-exist.invalid');
+  } catch (e) {
+    if (e && e.code === 'ECONNREFUSED') dns.setServers(['8.8.8.8', '1.1.1.1']);
+  }
+}
+
+async function initMongo(uri, { seed = true } = {}) {
+  await ensureDns();
+  const client = new MongoClient(uri, { serverSelectionTimeoutMS: 15000 });
+  await client.connect();
+  const db = client.db(MONGO_DB_NAME);
+  const store = {
+    client, db,
+    col: (name) => db.collection(name),
+    // Read one row (drops the Mongo _id so shapes match SQLite exactly).
+    async one(name, filter, opts = {}) {
+      return db.collection(name).findOne(filter, { projection: { _id: 0 }, ...opts });
+    },
+    async many(name, filter, opts = {}) {
+      return db.collection(name).find(filter, { projection: { _id: 0 }, ...opts }).toArray();
+    },
+    // SQLite AUTOINCREMENT equivalent: per-collection counter.
+    async nextId(name) {
+      const r = await db.collection('counters').findOneAndUpdate(
+        { _id: name }, { $inc: { seq: 1 } },
+        { upsert: true, returnDocument: 'after' }
+      );
+      return r && r.value ? r.value.seq : 1;
+    }
+  };
+  if (seed) await seedMongo(store);
+  return store;
+}
+
+async function seedMongo(store) {
+  const settingsCount = await store.col('settings').countDocuments();
+  if (settingsCount > 0) return;
+  for (const [k, v] of Object.entries(DEFAULT_SETTINGS)) {
+    await store.col('settings').insertOne({ id: await store.nextId('settings'), key: k, value: JSON.stringify(v) });
+  }
+  const mk = async (username, role, password) => store.col('users').insertOne({
+    id: await store.nextId('users'), username, password_hash: hashPassword(password),
+    role, status: 'active', force_password_change: 0, created_at: new Date().toISOString().slice(0, 19).replace('T', ' ')
+  });
+  await mk('admin', 'admin', 'admin@123');
+  await mk('manager', 'manager', 'manager@123');
+  console.log('🌱 Mongo database seeded (admin / admin@123, manager / manager@123)');
+}
+
+module.exports = { initDb, initMongo, seedMongo, hashPassword, verifyPassword, DEFAULT_SETTINGS, DB_PATH, MONGO_DB_NAME };
