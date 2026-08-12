@@ -306,7 +306,7 @@ route('POST', '/api/auth/logout', async (req, res) => {
 route('GET', '/api/auth/me', async (req, res) => {
   const user = await auth(req, res, null);
   if (!user) return;
-  ok(res, { user: { id: user.id, username: user.username, role: user.role, linked_type: user.linked_type, linked_id: user.linked_id, force_password_change: !!user.force_password_change, linked: await linkedName(user), last_login: user.last_login } });
+  ok(res, { user: { id: user.id, username: user.username, role: user.role, linked_type: user.linked_type, linked_id: user.linked_id, force_password_change: !!user.force_password_change, linked: await linkedName(user), last_login: user.last_login }, settings: await getSettings() });
 });
 route('POST', '/api/auth/change-password', async (req, res) => {
   const user = await auth(req, res, null);
@@ -319,6 +319,9 @@ route('POST', '/api/auth/change-password', async (req, res) => {
 });
 route('GET', '/api/public-info', async (req, res) => {
   const s = await getSettings();
+  // School name/logo/theme rarely change — let the browser cache this so page
+  // loads don't pay an extra serverless round trip every time.
+  res.setHeader('Cache-Control', 'public, max-age=300');
   ok(res, { school: s.school, appearance: s.appearance });
 });
 

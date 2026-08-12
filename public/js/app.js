@@ -132,9 +132,11 @@ window.SMS = window.SMS || {};
 
       // already logged in?
       if (api.state.token) {
+        // /api/auth/me returns user + settings in one round trip (fewer
+        // serverless cold starts = faster page load).
         api.get('/api/auth/me').then(d => {
           api.state.user = d.user;
-          return api.get('/api/settings').then(s => { api.state.settings = s.settings; });
+          api.state.settings = d.settings;
         }).then(() => enterApp()).catch(() => { api.clearToken(); showLogin(); });
       } else {
         showLogin();
