@@ -168,7 +168,7 @@ window.SMS = window.SMS || {};
       document.title = s.name + ' — School Management';
       if (s.logo) setFavicon(s.logo);
       const brandLogo = document.getElementById('brand-logo');
-      if (s.logo) brandLogo.innerHTML = `<img src="${s.logo}" alt="School logo" style="width:100%;height:100%;object-fit:cover;border-radius:12px">`;
+      if (s.logo) brandLogo.innerHTML = `<img src="${s.logo}" alt="School logo" style="width:100%;height:100%;object-fit:contain">`;
       else brandLogo.textContent = '🏫';
       // Topbar: show the uploaded school logo next to the page title
       const topbarLogo = document.getElementById('topbar-logo');
