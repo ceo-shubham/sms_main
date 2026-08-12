@@ -1,14 +1,27 @@
 # 🏫 School Management System
 
-A complete, production-style School Management System built as a **zero-dependency Node.js app** — a native HTTP API server backed by SQLite, with a responsive single-page frontend. No `npm install` required.
+A complete, production-style School Management System — a native HTTP API server backed by SQLite, with a responsive single-page frontend.
 
-## Quick Start
+## Quick Start (local)
 
 ```bash
 node server.js
 ```
 
 Then open **http://localhost:4321** (override the port with `SMS_PORT=xxxx node server.js`, and the backup folder with `SMS_BACKUP_DIR=./mybackups node server.js`).
+
+When `TURSO_URL` is set in `.env`, the app uses a hosted **Turso** database instead of the local file (see below).
+
+## Deploy (Vercel + Turso + Backblaze B2)
+
+The app is serverless-ready: `api/index.js` is the Vercel entry that reuses the same request handler, and `vercel.json` maps `/api/*` to it with `public/` as static files.
+
+1. **Turso** — free signup at turso.tech, create a database, then generate a **database token** (Databases → your db → *Generate Token*). Set `TURSO_URL` and `TURSO_AUTH_TOKEN`. These two env vars make the app use Turso everywhere, including Vercel.
+2. **Backblaze B2** — create a Private bucket and an app key limited to that bucket; set `B2_KEY_ID`, `B2_APP_KEY`, `B2_BUCKET`, `B2_ENDPOINT`. Backups are then uploaded to B2 automatically.
+3. **Vercel** — import the repo, add all the env vars from `.env.example` (plus `SESSION_SECRET`), and deploy. No code changes needed between local and production.
+4. **Migrate existing data** — `node --env-file=.env migrate-turso.js` copies the local `data/school.db` into Turso.
+
+Copy `.env.example` to `.env`, fill in the values, then run `node --env-file=.env server.js` to run with Turso locally.
 
 The database (`data/school.db`) is created fresh on first run — no demo/fake data. The system starts with only two accounts.
 
@@ -50,12 +63,15 @@ All such accounts are forced to change their password on first login. The admin 
 
 ```
 server.js            HTTP server + all API routes (no frameworks)
-db.js                SQLite schema + clean bootstrap (admin/manager only)
-backup.js            Automatic CSV backups by date → module (only where there is data)
+db.js                SQLite/Turso data layer + schema + bootstrap (admin/manager only)
+api/index.js         Vercel serverless entry (reuses the same request handler)
+vercel.json          Vercel routing: /api/* -> function, rest -> public/
+backup.js            Automatic CSV backups by date → module, uploaded to B2 when configured
+migrate-turso.js     One-off: copy local data/school.db into Turso
 public/index.html    SPA shell
 public/css/app.css   Design system (CSS variables, theming, print styles)
 public/js/           api, ui, charts (hand-rolled SVG), router + pages
-data/school.db       SQLite database (auto-created, git-ignored)
+data/school.db       Local SQLite database (dev only, auto-created, git-ignored)
 backups/YYYY-MM-DD/  Daily backups: attendance/, fees/, students/, employees/, …
 ```
 
