@@ -1,0 +1,141 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>School Management System</title>
+<link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><text y='.9em' font-size='90'>🏫</text></svg>">
+<link rel="stylesheet" href="/css/app.css">
+</head>
+<body>
+
+<!-- ============ LOGIN SCREEN ============ -->
+<div id="login-screen" class="login-screen hidden">
+  <div class="login-box">
+
+    <div class="login-head">
+      <div class="login-logo-wrap">
+        <div class="login-logo-icon" id="login-logo">
+          <span class="login-logo-emoji">🏫</span>
+          <img id="login-logo-img" class="hidden" alt="School logo">
+        </div>
+      </div>
+      <h1 id="login-school-name">My School</h1>
+      <div class="login-subtitle" id="login-system-name">School Management System</div>
+    </div>
+
+    <div class="login-card">
+      <h2 class="login-title">Sign in to your account</h2>
+      <form id="login-form" novalidate>
+        <label class="login-label" for="login-username">Username</label>
+        <div class="input-group">
+          <span class="input-ico" id="ico-user"></span>
+          <input type="text" id="login-username" placeholder="Enter your username" autocomplete="username" required>
+        </div>
+        <label class="login-label" for="login-password">Password</label>
+        <div class="input-group">
+          <span class="input-ico" id="ico-lock"></span>
+          <input type="password" id="login-password" placeholder="Enter your password" autocomplete="current-password" required>
+          <button type="button" class="eye-btn" id="eye-login" title="Show / hide password"></button>
+        </div>
+        <div class="login-row">
+          <a class="forgot-link" id="forgot-link">Forgot password?</a>
+        </div>
+        <div id="login-error" class="login-error hidden"></div>
+        <button type="submit" class="btn-login" id="login-btn">Sign In <span class="btn-arrow">→</span></button>
+      </form>
+    </div>
+
+    <div class="login-foot">
+      <div>© <span id="login-year">2026</span> School Management System. All rights reserved.</div>
+      <div>Designed &amp; Developed by <b class="login-foot-brand">Shubham Pathak</b></div>
+    </div>
+
+  </div>
+</div>
+
+<!-- ============ CHANGE PASSWORD GATE ============ -->
+<div id="pw-screen" class="pw-screen hidden">
+  <div class="pw-card">
+    <div class="pw-icon">🔑</div>
+    <h2>Set a new password</h2>
+    <p>For security, you must choose a new password before continuing.</p>
+    <form id="pw-form">
+      <label>Current password
+        <div class="input-group">
+          <input type="password" id="pw-old" required>
+          <button type="button" class="eye-btn" id="eye-pw-old" title="Show / hide password"></button>
+        </div>
+      </label>
+      <label>New password
+        <div class="input-group">
+          <input type="password" id="pw-new" required minlength="6">
+          <button type="button" class="eye-btn" id="eye-pw-new" title="Show / hide password"></button>
+        </div>
+      </label>
+      <label>Confirm new password
+        <div class="input-group">
+          <input type="password" id="pw-confirm" required minlength="6">
+          <button type="button" class="eye-btn" id="eye-pw-confirm" title="Show / hide password"></button>
+        </div>
+      </label>
+      <div id="pw-error" class="login-error hidden"></div>
+      <button type="submit" class="btn btn-primary btn-block">Update Password</button>
+    </form>
+  </div>
+</div>
+
+<!-- ============ APP SHELL ============ -->
+<div id="app-shell" class="app hidden">
+  <aside id="sidebar" class="sidebar">
+    <div class="brand">
+      <div class="brand-logo" id="brand-logo">🏫</div>
+    </div>
+    <nav class="nav" id="nav"></nav>
+    <div class="sidebar-user" id="sidebar-user"></div>
+  </aside>
+
+  <div class="main">
+    <header class="topbar">
+      <button class="icon-btn hamburger" id="hamburger" title="Toggle menu">☰</button>
+      <img class="topbar-logo hidden" id="topbar-logo" alt="School logo">
+      <div class="page-title" id="page-title">Dashboard</div>
+      <div class="topbar-right">
+        <div class="notif-bell" id="notif-bell" title="Notifications">
+          <svg id="bell-icon"></svg>
+          <span class="notif-badge hidden" id="notif-badge">0</span>
+        </div>
+        <div class="user-chip" id="user-chip">
+          <div class="user-avatar" id="user-avatar">A</div>
+          <div class="user-meta">
+            <div class="user-name" id="user-name">Admin</div>
+            <div class="user-role" id="user-role">Administrator</div>
+          </div>
+        </div>
+        <div class="user-menu hidden" id="user-menu">
+          <button data-action="change-password">Change Password</button>
+          <button data-action="logout">Sign Out</button>
+        </div>
+      </div>
+    </header>
+    <main id="view" class="view"></main>
+  </div>
+</div>
+
+<nav class="mobile-nav hidden" id="mobile-nav"></nav>
+
+<div id="modal-root"></div>
+<div id="toast-root"></div>
+<div id="overlay"></div>
+
+<script src="/js/api.js"></script>
+<script src="/js/ui.js"></script>
+<script src="/js/charts.js"></script>
+<script src="/js/pages-core.js"></script>
+<script src="/js/pages-students.js"></script>
+<script src="/js/pages-academics.js"></script>
+<script src="/js/pages-admin.js"></script>
+<script src="/js/pages-parent.js"></script>
+<script src="/js/app.js"></script>
+</body>
+</html>

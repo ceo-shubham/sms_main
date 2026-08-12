@@ -1,0 +1,18 @@
+# secrets — never commit
+.env
+.env.*
+!.env.example
+
+# runtime data (live SQLite DB + backups = real school data)
+data/
+backups/
+server.log
+
+# tooling
+node_modules/
+.freebuff/
+.vscode/
+.DS_Store
+
+# dev artifacts
+_login_test.js
