@@ -4,17 +4,30 @@ const http = require('node:http');
 const fs = require('node:fs');
 const path = require('node:path');
 const crypto = require('node:crypto');
-const { initDb, hashPassword, verifyPassword, DEFAULT_SETTINGS } = require('./db');
+const { createDb, hashPassword, verifyPassword, DEFAULT_SETTINGS } = require('./db');
 const backup = require('./backup');
 
 const PORT = process.env.SMS_PORT || 4321;
 const PUBLIC_DIR = path.join(__dirname, 'public');
 
-const db = initDb();
+// Data layer is initialised lazily (Turso when TURSO_URL is set, else local
+// SQLite) so importing this module never blocks on a database connection.
+let db = null;
+let dbReady = null;
+function ensureDb() {
+  if (!dbReady) {
+    dbReady = createDb().then((d) => {
+      db = d;
+      // Local-dev only: periodic CSV backups. On Vercel (serverless) timers +
+      // local disk don't apply — backups are pushed to B2 instead (backup.js).
+      if (require.main === module) backup.startAutoBackup(db, 60000);
+      return d;
+    });
+  }
+  return dbReady;
+}
+
 const sessions = new Map(); // token -> { userId, lastActive }
-// Local-dev only: periodic CSV backups. On Vercel (serverless) timers + local disk
-// don't apply — backups are pushed to B2 instead (see backup.js).
-if (require.main === module) backup.startAutoBackup(db, 60000);
 
 // ---------------------------------------------------------------------------
 // helpers
@@ -70,23 +83,23 @@ const readBody = (req) => new Promise((resolve, reject) => {
   req.on('error', reject);
 });
 
-function genAdmissionNo() {
-  const settings = getSettings();
+async function genAdmissionNo() {
+  const settings = await getSettings();
   const code = (settings.academic.schoolCode || 'SCH').toUpperCase();
   const year = new Date().getFullYear();
-  const count = db.prepare('SELECT COUNT(*) c FROM students').get().c;
+  const count = (await db.prepare('SELECT COUNT(*) c FROM students').get()).c;
   let n = count + 1, no;
-  do { no = `${code}-${year}-${String(n++).padStart(3, '0')}`; } while (db.prepare('SELECT 1 x FROM students WHERE admission_no=?').get(no));
+  do { no = `${code}-${year}-${String(n++).padStart(3, '0')}`; } while (await db.prepare('SELECT 1 x FROM students WHERE admission_no=?').get(no));
   return no;
 }
-function genEmpCode() {
-  const count = db.prepare('SELECT COUNT(*) c FROM employees').get().c;
+async function genEmpCode() {
+  const count = (await db.prepare('SELECT COUNT(*) c FROM employees').get()).c;
   let n = count + 1, code;
-  do { code = `EMP-${String(n++).padStart(3, '0')}`; } while (db.prepare('SELECT 1 x FROM employees WHERE code=?').get(code));
+  do { code = `EMP-${String(n++).padStart(3, '0')}`; } while (await db.prepare('SELECT 1 x FROM employees WHERE code=?').get(code));
   return code;
 }
-function genReceiptNo() {
-  const count = db.prepare('SELECT COUNT(*) c FROM payments').get().c;
+async function genReceiptNo() {
+  const count = (await db.prepare('SELECT COUNT(*) c FROM payments').get()).c;
   return `RCPT-${String(count + 1).padStart(6, '0')}`;
 }
 function genTempPassword() {
@@ -142,12 +155,12 @@ function guardianOf(s) {
 }
 
 // Create (if missing) the parent login account for a student's admission number
-function ensureParentLogin(admissionNo, force, parentId) {
+async function ensureParentLogin(admissionNo, force, parentId) {
   if (!admissionNo) return null;
   const uname = String(admissionNo).trim();
-  const existing = db.prepare('SELECT id FROM users WHERE username=? COLLATE NOCASE').get(uname);
+  const existing = await db.prepare('SELECT id FROM users WHERE username=? COLLATE NOCASE').get(uname);
   if (existing) return existing.id;
-  const r = db.prepare('INSERT INTO users (username,password_hash,role,linked_type,linked_id,status,force_password_change) VALUES (?,?,?,?,?,?,?)')
+  const r = await db.prepare('INSERT INTO users (username,password_hash,role,linked_type,linked_id,status,force_password_change) VALUES (?,?,?,?,?,?,?)')
     .run(uname, hashPassword(uname + '@123'), 'parent', 'parent', parentId || null, 'active', force ? 1 : 0);
   return Number(r.lastInsertRowid);
 }
@@ -157,8 +170,8 @@ function usernameFrom(name, phone) {
   return `${base}_${suffix}`;
 }
 
-function getSettings() {
-  const rows = db.prepare('SELECT key, value FROM settings').all();
+async function getSettings() {
+  const rows = await db.prepare('SELECT key, value FROM settings').all();
   const out = {};
   for (const r of rows) out[r.key] = JSON.parse(r.value);
   return out;
@@ -215,13 +228,13 @@ function audienceMatches(audience, role) {
 // ---------------------------------------------------------------------------
 // auth middleware
 // ---------------------------------------------------------------------------
-function auth(req, res, roles) {
+async function auth(req, res, roles) {
   const token = (req.headers.authorization || '').replace(/^Bearer\s+/i, '') || (req.url.split('?')[0] && new URL(req.url, 'http://x').searchParams.get('token')) || '';
   const sess = sessions.get(token);
   if (!sess) { fail(res, 401, 'Not authenticated'); return null; }
-  const user = db.prepare('SELECT * FROM users WHERE id=?').get(sess.userId);
+  const user = await db.prepare('SELECT * FROM users WHERE id=?').get(sess.userId);
   if (!user || user.status !== 'active') { sessions.delete(token); fail(res, 401, 'Account is not active'); return null; }
-  const settings = getSettings();
+  const settings = await getSettings();
   const timeoutMin = Number(settings.security.sessionTimeout) || 30;
   const idle = (Date.now() - sess.lastActive) / 60000;
   if (idle > timeoutMin) {
@@ -243,7 +256,7 @@ function auth(req, res, roles) {
 // ---- auth ----
 route('POST', '/api/auth/login', async (req, res) => {
   const body = await readBody(req);
-  const user = db.prepare('SELECT * FROM users WHERE username=? COLLATE NOCASE').get(String(body.username || '').trim());
+  const user = await db.prepare('SELECT * FROM users WHERE username=? COLLATE NOCASE').get(String(body.username || '').trim());
   if (!user || !verifyPassword(body.password, user.password_hash)) {
     fail(res, 401, 'Invalid username or password');
     return;
@@ -251,83 +264,83 @@ route('POST', '/api/auth/login', async (req, res) => {
   if (user.status !== 'active') { fail(res, 403, 'Your account has been deactivated. Contact the administrator.'); return; }
   const token = crypto.randomBytes(24).toString('hex');
   sessions.set(token, { userId: user.id, lastActive: Date.now() });
-  db.prepare('UPDATE users SET last_login=? WHERE id=?').run(todayStr(), user.id);
-  const linked = linkedName(user);
+  await db.prepare('UPDATE users SET last_login=? WHERE id=?').run(todayStr(), user.id);
+  const linked = await linkedName(user);
   ok(res, {
     token, user: {
       id: user.id, username: user.username, role: user.role, linked_type: user.linked_type,
       linked_id: user.linked_id, force_password_change: !!user.force_password_change, linked,
       last_login: user.last_login
     },
-    settings: getSettings()
+    settings: await getSettings()
   });
 });
-route('POST', '/api/auth/logout', (req, res) => {
+route('POST', '/api/auth/logout', async (req, res) => {
   const token = (req.headers.authorization || '').replace(/^Bearer\s+/i, '');
   sessions.delete(token);
   ok(res, { ok: true });
 });
-route('GET', '/api/auth/me', (req, res) => {
-  const user = auth(req, res, null);
+route('GET', '/api/auth/me', async (req, res) => {
+  const user = await auth(req, res, null);
   if (!user) return;
-  ok(res, { user: { id: user.id, username: user.username, role: user.role, linked_type: user.linked_type, linked_id: user.linked_id, force_password_change: !!user.force_password_change, linked: linkedName(user), last_login: user.last_login } });
+  ok(res, { user: { id: user.id, username: user.username, role: user.role, linked_type: user.linked_type, linked_id: user.linked_id, force_password_change: !!user.force_password_change, linked: await linkedName(user), last_login: user.last_login } });
 });
 route('POST', '/api/auth/change-password', async (req, res) => {
-  const user = auth(req, res, null);
+  const user = await auth(req, res, null);
   if (!user) return;
   const body = await readBody(req);
   if (!verifyPassword(body.old_password, user.password_hash)) { fail(res, 400, 'Current password is incorrect'); return; }
   if (!body.new_password || String(body.new_password).length < 6) { fail(res, 400, 'New password must be at least 6 characters'); return; }
-  db.prepare('UPDATE users SET password_hash=?, force_password_change=0 WHERE id=?').run(hashPassword(body.new_password), user.id);
+  await db.prepare('UPDATE users SET password_hash=?, force_password_change=0 WHERE id=?').run(hashPassword(body.new_password), user.id);
   ok(res, { ok: true });
 });
-route('GET', '/api/public-info', (req, res) => {
-  const s = getSettings();
+route('GET', '/api/public-info', async (req, res) => {
+  const s = await getSettings();
   ok(res, { school: s.school, appearance: s.appearance });
 });
 
 // ---- dashboard ----
-route('GET', '/api/dashboard', (req, res) => {
-  const user = auth(req, res, null);
+route('GET', '/api/dashboard', async (req, res) => {
+  const user = await auth(req, res, null);
   if (!user) return;
   if (user.role === 'parent') return ok(res, { parentPortal: true });
   const today = todayStr();
   const stats = {
-    totalStudents: db.prepare("SELECT COUNT(*) c FROM students WHERE status='active'").get().c,
-    totalStaff: db.prepare("SELECT COUNT(*) c FROM employees WHERE status='active'").get().c,
-    totalCollected: db.prepare('SELECT COALESCE(SUM(amount),0) s FROM payments').get().s,
-    totalRoutes: db.prepare('SELECT COUNT(*) c FROM routes').get().c,
-    todayStudents: db.prepare("SELECT COUNT(*) c FROM attendance WHERE date=? AND kind='student'").get(today).c,
-    todayStaff: db.prepare("SELECT COUNT(*) c FROM attendance WHERE date=? AND kind='employee'").get(today).c,
-    todayPresentStudents: db.prepare("SELECT COUNT(*) c FROM attendance WHERE date=? AND kind='student' AND status IN ('present','late')").get(today).c,
-    todayPresentStaff: db.prepare("SELECT COUNT(*) c FROM attendance WHERE date=? AND kind='employee' AND status IN ('present','late')").get(today).c,
-    studentsOnBus: db.prepare("SELECT COUNT(*) c FROM students WHERE route_id IS NOT NULL AND status='active'").get().c,
-    pendingSalaries: db.prepare("SELECT COUNT(*) c FROM salaries WHERE status='pending'").get().c
+    totalStudents: (await db.prepare("SELECT COUNT(*) c FROM students WHERE status='active'").get()).c,
+    totalStaff: (await db.prepare("SELECT COUNT(*) c FROM employees WHERE status='active'").get()).c,
+    totalCollected: (await db.prepare('SELECT COALESCE(SUM(amount),0) s FROM payments').get()).s,
+    totalRoutes: (await db.prepare('SELECT COUNT(*) c FROM routes').get()).c,
+    todayStudents: (await db.prepare("SELECT COUNT(*) c FROM attendance WHERE date=? AND kind='student'").get(today)).c,
+    todayStaff: (await db.prepare("SELECT COUNT(*) c FROM attendance WHERE date=? AND kind='employee'").get(today)).c,
+    todayPresentStudents: (await db.prepare("SELECT COUNT(*) c FROM attendance WHERE date=? AND kind='student' AND status IN ('present','late')").get(today)).c,
+    todayPresentStaff: (await db.prepare("SELECT COUNT(*) c FROM attendance WHERE date=? AND kind='employee' AND status IN ('present','late')").get(today)).c,
+    studentsOnBus: (await db.prepare("SELECT COUNT(*) c FROM students WHERE route_id IS NOT NULL AND status='active'").get()).c,
+    pendingSalaries: (await db.prepare("SELECT COUNT(*) c FROM salaries WHERE status='pending'").get()).c
   };
-  const monthly = db.prepare("SELECT strftime('%Y-%m',date) m, SUM(amount) total FROM payments GROUP BY m ORDER BY m DESC LIMIT 12").all().reverse();
-  const gender = db.prepare("SELECT gender, COUNT(*) c FROM students WHERE status='active' GROUP BY gender").all();
-  const classStrength = db.prepare("SELECT class, section, COUNT(*) c FROM students WHERE status='active' GROUP BY class, section ORDER BY class, section").all();
+  const monthly = (await db.prepare("SELECT strftime('%Y-%m',date) m, SUM(amount) total FROM payments GROUP BY m ORDER BY m DESC LIMIT 12").all()).reverse();
+  const gender = await db.prepare("SELECT gender, COUNT(*) c FROM students WHERE status='active' GROUP BY gender").all();
+  const classStrength = await db.prepare("SELECT class, section, COUNT(*) c FROM students WHERE status='active' GROUP BY class, section ORDER BY class, section").all();
   const trendDays = 7;
   const trend = [];
-  const denomS = Math.max(db.prepare("SELECT COUNT(*) c FROM students WHERE status='active'").get().c, 1);
-  const denomE = Math.max(db.prepare("SELECT COUNT(*) c FROM employees WHERE status='active'").get().c, 1);
+  const denomS = Math.max((await db.prepare("SELECT COUNT(*) c FROM students WHERE status='active'").get()).c, 1);
+  const denomE = Math.max((await db.prepare("SELECT COUNT(*) c FROM employees WHERE status='active'").get()).c, 1);
   for (let i = trendDays - 1; i >= 0; i--) {
     const d = new Date(); d.setDate(d.getDate() - i);
     const ds = `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}-${String(d.getDate()).padStart(2, '0')}`;
-    const s = db.prepare("SELECT status, COUNT(*) c FROM attendance WHERE date=? AND kind='student' GROUP BY status").all(ds);
-    const e = db.prepare("SELECT status, COUNT(*) c FROM attendance WHERE date=? AND kind='employee' GROUP BY status").all(ds);
+    const s = await db.prepare("SELECT status, COUNT(*) c FROM attendance WHERE date=? AND kind='student' GROUP BY status").all(ds);
+    const e = await db.prepare("SELECT status, COUNT(*) c FROM attendance WHERE date=? AND kind='employee' GROUP BY status").all(ds);
     const sum = (rows) => rows.filter(r => ['present', 'late'].includes(r.status)).reduce((a, r) => a + r.c, 0);
     trend.push({ date: ds, label: ds.slice(5), studentsPct: Math.round(sum(s) / denomS * 100), staffPct: Math.round(sum(e) / denomE * 100) });
   }
-  const notifs = db.prepare('SELECT * FROM notifications ORDER BY id DESC LIMIT 5').all().filter(n => audienceMatches(n.audience, user.role));
-  const exams = db.prepare('SELECT * FROM exams WHERE start_date >= ? ORDER BY start_date LIMIT 5').all(today);
-  const recentAdmissions = db.prepare("SELECT id, name, admission_no, class, section, created_at FROM students WHERE status='active' ORDER BY id DESC LIMIT 6").all();
+  const notifs = (await db.prepare('SELECT * FROM notifications ORDER BY id DESC LIMIT 5').all()).filter(n => audienceMatches(n.audience, user.role));
+  const exams = await db.prepare('SELECT * FROM exams WHERE start_date >= ? ORDER BY start_date LIMIT 5').all(today);
+  const recentAdmissions = await db.prepare("SELECT id, name, admission_no, class, section, created_at FROM students WHERE status='active' ORDER BY id DESC LIMIT 6").all();
   ok(res, { stats, monthly, gender, classStrength, trend, notifications: notifs, upcomingExams: exams, recentAdmissions });
 });
 
 // ---- students ----
-route('GET', '/api/students', (req, res) => {
-  const user = auth(req, res, null);
+route('GET', '/api/students', async (req, res) => {
+  const user = await auth(req, res, null);
   if (!user) return;
   const u = new URL(req.url, 'http://x');
   const search = (u.searchParams.get('search') || '').trim();
@@ -344,25 +357,25 @@ route('GET', '/api/students', (req, res) => {
   if (gender) { sql += ' AND s.gender = ?'; args.push(gender); }
   if (status) { sql += ' AND s.status = ?'; args.push(status); }
   sql += ' ORDER BY s.class, s.section, s.roll_no';
-  const students = db.prepare(sql).all(...args);
-  const classes = db.prepare('SELECT DISTINCT class FROM students ORDER BY class').all().map(r => r.class);
+  const students = await db.prepare(sql).all(...args);
+  const classes = (await db.prepare('SELECT DISTINCT class FROM students ORDER BY class').all()).map(r => r.class);
   const stat = {
-    total: db.prepare('SELECT COUNT(*) c FROM students').get().c,
-    boys: db.prepare("SELECT COUNT(*) c FROM students WHERE gender='M'").get().c,
-    girls: db.prepare("SELECT COUNT(*) c FROM students WHERE gender='F'").get().c,
-    active: db.prepare("SELECT COUNT(*) c FROM students WHERE status='active'").get().c
+    total: (await db.prepare('SELECT COUNT(*) c FROM students').get()).c,
+    boys: (await db.prepare("SELECT COUNT(*) c FROM students WHERE gender='M'").get()).c,
+    girls: (await db.prepare("SELECT COUNT(*) c FROM students WHERE gender='F'").get()).c,
+    active: (await db.prepare("SELECT COUNT(*) c FROM students WHERE status='active'").get()).c
   };
   ok(res, { students, classes, stats: stat });
 });
 route('POST', '/api/students', async (req, res) => {
-  const user = auth(req, res, ['admin', 'manager', 'staff']);
+  const user = await auth(req, res, ['admin', 'manager', 'staff']);
   if (!user) return;
   const body = await readBody(req);
   const s = body.student || body;
   if (!s.name) return fail(res, 400, 'Student name is required');
   const admission_no = String(s.admission_no || '').trim();
   if (!admission_no) return fail(res, 400, 'Admission number is required — it is given to the student at admission time');
-  if (db.prepare('SELECT 1 x FROM students WHERE admission_no=? COLLATE NOCASE').get(admission_no)) return fail(res, 400, 'This admission number is already used by another student');
+  if (await db.prepare('SELECT 1 x FROM students WHERE admission_no=? COLLATE NOCASE').get(admission_no)) return fail(res, 400, 'This admission number is already used by another student');
   const m1 = normalizeMobile(s.mobile1);
   const m2 = s.mobile2 ? normalizeMobile(s.mobile2) : null;
   if (s.mobile2 && !m2) return fail(res, 400, 'Second mobile number must be a valid 10-digit number');
@@ -371,77 +384,74 @@ route('POST', '/api/students', async (req, res) => {
   const guardian = guardianOf(s);
   let parentId = s.parent_id || null;
   let parentLogin = null;
-  db.exec('BEGIN');
   try {
     if (guardian) {
       // reuse an existing parent record for the same guardian + phone when possible
-      const existing = db.prepare('SELECT id FROM parents WHERE name=? AND phone=?').get(guardian, m1);
+      const existing = await db.prepare('SELECT id FROM parents WHERE name=? AND phone=?').get(guardian, m1);
       if (existing) parentId = existing.id;
       else {
-        const r = db.prepare('INSERT INTO parents (name,phone,email,occupation,address) VALUES (?,?,?,?,?)')
-          .run(guardian, m1, '', s.occupation || '', s.address || '');
-        parentId = Number(r.lastInsertRowid);
+        const pr = await db.batch([{ sql: 'INSERT INTO parents (name,phone,email,occupation,address) VALUES (?,?,?,?,?)', args: [guardian, m1, '', s.occupation || '', s.address || ''] }]);
+        parentId = pr.lastInsertRowid;
       }
     }
-    const r = db.prepare(`INSERT INTO students
+    const sr = await db.batch([{ sql: `INSERT INTO students
       (admission_no,name,class,section,roll_no,gender,dob,blood_group,religion,category,caste,address,
        father_name,mother_name,guardian_name,occupation,mobile1,mobile2,aadhar_no,pen,admission_date,parent_id,route_id,status)
-      VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`)
-      .run(admission_no, s.name, s.class || '', s.section || '', s.roll_no || null, s.gender || '', s.dob || '',
+      VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`, args: [
+        admission_no, s.name, s.class || '', s.section || '', s.roll_no || null, s.gender || '', s.dob || '',
         s.blood_group || '', s.religion || '', s.category || '', s.caste || '', s.address || '',
         s.father_name || '', s.mother_name || '', s.guardian_name || '', s.occupation || '', m1, m2 || '',
-        s.aadhar_no || '', s.pen || '', s.admission_date || todayStr(), parentId, s.route_id || null, s.status || 'active');
-    const sid = Number(r.lastInsertRowid);
+        s.aadhar_no || '', s.pen || '', s.admission_date || todayStr(), parentId, s.route_id || null, s.status || 'active'
+      ] }]);
+    const sid = sr.lastInsertRowid;
     if (parentId) {
-      db.prepare('UPDATE students SET parent_id=? WHERE id=?').run(parentId, sid);
+      await db.batch([{ sql: 'UPDATE students SET parent_id=? WHERE id=?', args: [parentId, sid] }]);
     }
     // parent login: username = admission number, password = admission number + @123
-    parentLogin = ensureParentLogin(admission_no, true, parentId);
-    db.exec('COMMIT');
-    const created = db.prepare('SELECT s.*, p.name parent_name FROM students s LEFT JOIN parents p ON p.id=s.parent_id WHERE s.id=?').get(sid);
+    parentLogin = await ensureParentLogin(admission_no, true, parentId);
+    const created = await db.prepare('SELECT s.*, p.name parent_name FROM students s LEFT JOIN parents p ON p.id=s.parent_id WHERE s.id=?').get(sid);
     ok(res, { student: created, parentLogin, defaultPassword: admission_no + '@123' });
   } catch (e) {
-    db.exec('ROLLBACK');
     fail(res, 400, e.message);
   }
 });
-route('GET', '/api/students/:id', (req, res, params) => {
-  const user = auth(req, res, null);
+route('GET', '/api/students/:id', async (req, res, params) => {
+  const user = await auth(req, res, null);
   if (!user) return;
   const id = Number(params.id);
-  const student = db.prepare('SELECT s.*, p.name parent_name, p.phone parent_phone, p.email parent_email, p.occupation parent_occupation, p.address parent_address, r.route_no, r.monthly_fee route_fee FROM students s LEFT JOIN parents p ON p.id=s.parent_id LEFT JOIN routes r ON r.id=s.route_id WHERE s.id=?').get(id);
+  const student = await db.prepare('SELECT s.*, p.name parent_name, p.phone parent_phone, p.email parent_email, p.occupation parent_occupation, p.address parent_address, r.route_no, r.monthly_fee route_fee FROM students s LEFT JOIN parents p ON p.id=s.parent_id LEFT JOIN routes r ON r.id=s.route_id WHERE s.id=?').get(id);
   if (!student) return fail(res, 404, 'Student not found');
-  const payments = db.prepare('SELECT * FROM payments WHERE student_id=? ORDER BY date DESC, id DESC').all(id);
+  const payments = await db.prepare('SELECT * FROM payments WHERE student_id=? ORDER BY date DESC, id DESC').all(id);
   const totalPaid = payments.reduce((a, p) => a + p.amount + p.discount, 0);
-  const totalDue = db.prepare('SELECT COALESCE(SUM(total_amount),0) s FROM fee_categories').get().s;
-  const att = db.prepare("SELECT COUNT(*) c, COALESCE(SUM(CASE WHEN status IN ('present','late') THEN 1 ELSE 0 END),0) p FROM attendance WHERE kind='student' AND ref_id=?").get(id);
-  ok(res, { student, payments, totalPaid, balance: Math.max(0, totalDue - totalPaid), attendancePct: att.c ? Math.round(att.p / att.c * 100) : null, routes: db.prepare('SELECT id, route_no FROM routes').all() });
+  const totalDue = (await db.prepare('SELECT COALESCE(SUM(total_amount),0) s FROM fee_categories').get()).s;
+  const att = await db.prepare("SELECT COUNT(*) c, COALESCE(SUM(CASE WHEN status IN ('present','late') THEN 1 ELSE 0 END),0) p FROM attendance WHERE kind='student' AND ref_id=?").get(id);
+  ok(res, { student, payments, totalPaid, balance: Math.max(0, totalDue - totalPaid), attendancePct: att.c ? Math.round(att.p / att.c * 100) : null, routes: await db.prepare('SELECT id, route_no FROM routes').all() });
 });
 route('PUT', '/api/students/:id', async (req, res, params) => {
-  const user = auth(req, res, ['admin', 'manager', 'staff']);
+  const user = await auth(req, res, ['admin', 'manager', 'staff']);
   if (!user) return;
   const body = await readBody(req);
   const s = body;
   if (!s.name) return fail(res, 400, 'Student name is required');
   if (s.admission_no) {
-    const dup = db.prepare('SELECT id FROM students WHERE admission_no=? COLLATE NOCASE AND id<>?').get(s.admission_no, Number(params.id));
+    const dup = await db.prepare('SELECT id FROM students WHERE admission_no=? COLLATE NOCASE AND id<>?').get(s.admission_no, Number(params.id));
     if (dup) return fail(res, 400, 'This admission number is already used by another student');
   }
   const m1 = normalizeMobile(s.mobile1);
   const m2 = s.mobile2 ? normalizeMobile(s.mobile2) : null;
   if (s.mobile2 && !m2) return fail(res, 400, 'Second mobile number must be a valid 10-digit number');
   if (!m1) return fail(res, 400, 'At least one valid 10-digit mobile number is required (with +91)');
-  const existing = db.prepare('SELECT * FROM students WHERE id=?').get(Number(params.id));
+  const existing = await db.prepare('SELECT * FROM students WHERE id=?').get(Number(params.id));
   if (!existing) return fail(res, 404, 'Student not found');
   const guardian = guardianOf(s);
   let parentId = existing.parent_id || null;
   if (guardian && parentId) {
-    db.prepare('UPDATE parents SET name=?,phone=?,occupation=?,address=? WHERE id=?').run(guardian, m1, s.occupation || '', s.address || '', parentId);
+    await db.prepare('UPDATE parents SET name=?,phone=?,occupation=?,address=? WHERE id=?').run(guardian, m1, s.occupation || '', s.address || '', parentId);
   } else if (guardian && !parentId) {
-    const r = db.prepare('INSERT INTO parents (name,phone,occupation,address) VALUES (?,?,?,?)').run(guardian, m1, s.occupation || '', s.address || '');
+    const r = await db.prepare('INSERT INTO parents (name,phone,occupation,address) VALUES (?,?,?,?)').run(guardian, m1, s.occupation || '', s.address || '');
     parentId = Number(r.lastInsertRowid);
   }
-  db.prepare(`UPDATE students SET name=?,class=?,section=?,roll_no=?,gender=?,dob=?,blood_group=?,religion=?,category=?,caste=?,address=?,
+  await db.prepare(`UPDATE students SET name=?,class=?,section=?,roll_no=?,gender=?,dob=?,blood_group=?,religion=?,category=?,caste=?,address=?,
     father_name=?,mother_name=?,guardian_name=?,occupation=?,mobile1=?,mobile2=?,aadhar_no=?,pen=?,admission_date=?,parent_id=?,route_id=?,status=? WHERE id=?`)
     .run(s.name, s.class || '', s.section || '', s.roll_no || null, s.gender || '', s.dob || '', s.blood_group || '',
       s.religion || '', s.category || '', s.caste || '', s.address || '', s.father_name || '', s.mother_name || '',
@@ -449,22 +459,22 @@ route('PUT', '/api/students/:id', async (req, res, params) => {
       s.admission_date || existing.admission_date, parentId, s.route_id || null, s.status || 'active', Number(params.id));
   ok(res, { ok: true });
 });
-route('DELETE', '/api/students/:id', (req, res, params) => {
-  const user = auth(req, res, ['admin', 'manager']);
+route('DELETE', '/api/students/:id', async (req, res, params) => {
+  const user = await auth(req, res, ['admin', 'manager']);
   if (!user) return;
-  db.prepare('DELETE FROM students WHERE id=?').run(Number(params.id));
+  await db.prepare('DELETE FROM students WHERE id=?').run(Number(params.id));
   ok(res, { ok: true });
 });
-route('GET', '/api/students/export/csv', (req, res) => {
-  const user = auth(req, res, null);
+route('GET', '/api/students/export/csv', async (req, res) => {
+  const user = await auth(req, res, null);
   if (!user) return;
-  const rows = db.prepare(`SELECT admission_no,name,class,section,roll_no,gender,dob,blood_group,religion,category,caste,address,father_name,mother_name,guardian_name,occupation,mobile1,mobile2,aadhar_no,pen,admission_date,status FROM students ORDER BY class,roll_no`).all();
+  const rows = await db.prepare(`SELECT admission_no,name,class,section,roll_no,gender,dob,blood_group,religion,category,caste,address,father_name,mother_name,guardian_name,occupation,mobile1,mobile2,aadhar_no,pen,admission_date,status FROM students ORDER BY class,roll_no`).all();
   const csv = toCSV([['Admission No','Name','Class','Section','Roll No','Gender','DOB','Blood Group','Religion','Category','Caste','Address','Father Name','Mother Name','Guardian Name','Occupation','Mobile 1','Mobile 2','Aadhaar No','PEN','Admission Date','Status'], ...rows.map(r => Object.values(r))]);
   res.writeHead(200, { 'Content-Type': 'text/csv', 'Content-Disposition': 'attachment; filename="students.csv"' });
   res.end(csv);
 });
 route('POST', '/api/students/import', async (req, res) => {
-  const user = auth(req, res, ['admin', 'manager']);
+  const user = await auth(req, res, ['admin', 'manager']);
   if (!user) return;
   const body = await readBody(req);
   const rows = parseCSV(body.csv || '');
@@ -481,13 +491,12 @@ route('POST', '/api/students/import', async (req, res) => {
   if (map.name < 0) return fail(res, 400, 'CSV must include a "Name" column');
   let created = 0, skipped = 0, parentLogins = 0;
   const errors = [];
-  db.exec('BEGIN');
   try {
     for (const r of rows.slice(1)) {
       const name = (r[map.name] || '').trim();
       if (!name) { skipped++; continue; }
       const admission = (r[map.admission] || '').trim();
-      if (!admission || db.prepare('SELECT 1 x FROM students WHERE admission_no=? COLLATE NOCASE').get(admission)) { skipped++; continue; }
+      if (!admission || await db.prepare('SELECT 1 x FROM students WHERE admission_no=? COLLATE NOCASE').get(admission)) { skipped++; continue; }
       const father = (r[map.father] || '').trim();
       const mother = (r[map.mother] || '').trim();
       const guardian = (r[map.guardian] || '').trim() || father || mother;
@@ -498,47 +507,47 @@ route('POST', '/api/students/import', async (req, res) => {
       if (!m1) { errors.push(`${admission}: invalid or missing mobile 1`); skipped++; continue; }
       let parentId = null;
       if (guardian) {
-        const existing = db.prepare('SELECT id FROM parents WHERE name=? AND phone=?').get(guardian, m1);
+        const existing = await db.prepare('SELECT id FROM parents WHERE name=? AND phone=?').get(guardian, m1);
         if (existing) parentId = existing.id;
         else {
-          const pr = db.prepare('INSERT INTO parents (name,phone,occupation,address) VALUES (?,?,?,?)').run(guardian, m1, (r[map.occupation] || '').trim(), (r[map.address] || '').trim());
-          parentId = Number(pr.lastInsertRowid);
+          const pr = await db.batch([{ sql: 'INSERT INTO parents (name,phone,occupation,address) VALUES (?,?,?,?)', args: [guardian, m1, (r[map.occupation] || '').trim(), (r[map.address] || '').trim()] }]);
+          parentId = pr.lastInsertRowid;
         }
       }
-      db.prepare(`INSERT INTO students
+      await db.batch([{ sql: `INSERT INTO students
         (admission_no,name,class,section,roll_no,gender,dob,blood_group,religion,category,caste,address,
          father_name,mother_name,guardian_name,occupation,mobile1,mobile2,aadhar_no,pen,admission_date,parent_id,status)
-        VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`)
-        .run(admission, name, (r[map.class] || '').trim(), (r[map.section] || '').trim(), (r[map.roll] || '').trim() || null,
+        VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`, args: [
+          admission, name, (r[map.class] || '').trim(), (r[map.section] || '').trim(), (r[map.roll] || '').trim() || null,
           (r[map.gender] || '').trim(), (r[map.dob] || '').trim(), (r[map.blood] || '').trim(), (r[map.religion] || '').trim(),
           (r[map.category] || '').trim(), (r[map.caste] || '').trim(), (r[map.address] || '').trim(), father, mother, guardian,
           (r[map.occupation] || '').trim(), m1, m2 || '', (r[map.aadhar] || '').trim(), (r[map.pen] || '').trim(),
-          (r[map.adate] || '').trim() || todayStr(), parentId, 'active');
-      if (ensureParentLogin(admission, true, parentId)) parentLogins++;
+          (r[map.adate] || '').trim() || todayStr(), parentId, 'active'
+        ] }]);
+      if (await ensureParentLogin(admission, true, parentId)) parentLogins++;
       created++;
     }
-    db.exec('COMMIT');
     ok(res, { created, skipped, parentLogins, errors: errors.slice(0, 10) });
-  } catch (e) { db.exec('ROLLBACK'); fail(res, 400, 'Import failed: ' + e.message); }
+  } catch (e) { fail(res, 400, 'Import failed: ' + e.message); }
 });
-route('GET', '/api/admissions/overview', (req, res) => {
-  const user = auth(req, res, null);
+route('GET', '/api/admissions/overview', async (req, res) => {
+  const user = await auth(req, res, null);
   if (!user) return;
   const today = todayStr();
   const month = today.slice(0, 7);
-  const recent = db.prepare("SELECT s.id,s.name,s.admission_no,s.class,s.section,s.status,s.created_at,p.name parent_name FROM students s LEFT JOIN parents p ON p.id=s.parent_id ORDER BY s.id DESC LIMIT 10").all();
+  const recent = await db.prepare("SELECT s.id,s.name,s.admission_no,s.class,s.section,s.status,s.created_at,p.name parent_name FROM students s LEFT JOIN parents p ON p.id=s.parent_id ORDER BY s.id DESC LIMIT 10").all();
   const stats = {
-    newThisMonth: db.prepare("SELECT COUNT(*) c FROM students WHERE created_at LIKE ?").get(month + '%').c,
-    active: db.prepare("SELECT COUNT(*) c FROM students WHERE status='active'").get().c,
-    transferred: db.prepare("SELECT COUNT(*) c FROM students WHERE status='transferred'").get().c,
-    total: db.prepare('SELECT COUNT(*) c FROM students').get().c
+    newThisMonth: (await db.prepare("SELECT COUNT(*) c FROM students WHERE created_at LIKE ?").get(month + '%')).c,
+    active: (await db.prepare("SELECT COUNT(*) c FROM students WHERE status='active'").get()).c,
+    transferred: (await db.prepare("SELECT COUNT(*) c FROM students WHERE status='transferred'").get()).c,
+    total: (await db.prepare('SELECT COUNT(*) c FROM students').get()).c
   };
   ok(res, { recent, stats });
 });
 
 // ---- parents ----
-route('GET', '/api/parents', (req, res) => {
-  const user = auth(req, res, null);
+route('GET', '/api/parents', async (req, res) => {
+  const user = await auth(req, res, null);
   if (!user) return;
   const u = new URL(req.url, 'http://x');
   const search = (u.searchParams.get('search') || '').trim();
@@ -546,50 +555,50 @@ route('GET', '/api/parents', (req, res) => {
   const args = [];
   if (search) { sql += ' AND (p.name LIKE ? OR p.phone LIKE ? OR p.email LIKE ?)'; args.push(`%${search}%`, `%${search}%`, `%${search}%`); }
   sql += ' ORDER BY p.name';
-  ok(res, { parents: db.prepare(sql).all(...args) });
+  ok(res, { parents: await db.prepare(sql).all(...args) });
 });
-route('GET', '/api/parents/:id', (req, res, params) => {
-  const user = auth(req, res, null);
+route('GET', '/api/parents/:id', async (req, res, params) => {
+  const user = await auth(req, res, null);
   if (!user) return;
-  const parent = db.prepare('SELECT * FROM parents WHERE id=?').get(Number(params.id));
+  const parent = await db.prepare('SELECT * FROM parents WHERE id=?').get(Number(params.id));
   if (!parent) return fail(res, 404, 'Parent not found');
-  const children = db.prepare('SELECT id,name,admission_no,class,section,roll_no,status FROM students WHERE parent_id=?').all(parent.id);
+  const children = await db.prepare('SELECT id,name,admission_no,class,section,roll_no,status FROM students WHERE parent_id=?').all(parent.id);
   ok(res, { parent, children });
 });
 route('POST', '/api/parents', async (req, res) => {
-  const user = auth(req, res, ['admin', 'manager', 'staff']);
+  const user = await auth(req, res, ['admin', 'manager', 'staff']);
   if (!user) return;
   const body = await readBody(req);
   if (!body.name) return fail(res, 400, 'Parent name is required');
-  const r = db.prepare('INSERT INTO parents (name,phone,email,occupation,address) VALUES (?,?,?,?,?)')
+  const r = await db.prepare('INSERT INTO parents (name,phone,email,occupation,address) VALUES (?,?,?,?,?)')
     .run(body.name, body.phone || '', body.email || '', body.occupation || '', body.address || '');
-  ok(res, { parent: db.prepare('SELECT * FROM parents WHERE id=?').get(Number(r.lastInsertRowid)) });
+  ok(res, { parent: await db.prepare('SELECT * FROM parents WHERE id=?').get(Number(r.lastInsertRowid)) });
 });
 route('PUT', '/api/parents/:id', async (req, res, params) => {
-  const user = auth(req, res, ['admin', 'manager', 'staff']);
+  const user = await auth(req, res, ['admin', 'manager', 'staff']);
   if (!user) return;
   const body = await readBody(req);
-  db.prepare('UPDATE parents SET name=?,phone=?,email=?,occupation=?,address=? WHERE id=?')
+  await db.prepare('UPDATE parents SET name=?,phone=?,email=?,occupation=?,address=? WHERE id=?')
     .run(body.name, body.phone || '', body.email || '', body.occupation || '', body.address || '', Number(params.id));
   ok(res, { ok: true });
 });
 
 // ---- attendance ----
-function teacherAssignment(user) {
+async function teacherAssignment(user) {
   if (user.role !== 'teacher') return null;
-  const e = db.prepare('SELECT * FROM employees WHERE id=?').get(user.linked_id);
+  const e = await db.prepare('SELECT * FROM employees WHERE id=?').get(user.linked_id);
   return (e && e.home_class) ? { class: e.home_class, section: e.home_section || '' } : null;
 }
 
-route('GET', '/api/attendance/roster', (req, res) => {
-  const user = auth(req, res, null);
+route('GET', '/api/attendance/roster', async (req, res) => {
+  const user = await auth(req, res, null);
   if (!user) return;
   const u = new URL(req.url, 'http://x');
   const date = u.searchParams.get('date') || todayStr();
   const kind = u.searchParams.get('kind') || 'student';
   let cls = u.searchParams.get('class') || '';
   let section = u.searchParams.get('section') || '';
-  const locked = kind === 'student' ? teacherAssignment(user) : null;
+  const locked = kind === 'student' ? await teacherAssignment(user) : null;
   if (locked) { cls = locked.class; section = locked.section; }
   let roster;
   if (kind === 'student') {
@@ -599,19 +608,19 @@ route('GET', '/api/attendance/roster', (req, res) => {
     if (cls) { sql += ' AND s.class=?'; args.push(cls); }
     if (section) { sql += ' AND s.section=?'; args.push(section); }
     sql += ' ORDER BY s.class, s.section, s.roll_no';
-    roster = db.prepare(sql).all(...args);
+    roster = await db.prepare(sql).all(...args);
   } else {
-    roster = db.prepare(`SELECT e.id ref_id, e.name, e.code, e.type, e.designation, a.status att FROM employees e
+    roster = await db.prepare(`SELECT e.id ref_id, e.name, e.code, e.type, e.designation, a.status att FROM employees e
       LEFT JOIN attendance a ON a.ref_id=e.id AND a.kind='employee' AND a.date=? WHERE e.status='active' ORDER BY e.type, e.name`).all(date);
   }
-  const classes = db.prepare('SELECT DISTINCT class FROM students ORDER BY class').all().map(r => r.class);
-  const sections = db.prepare('SELECT DISTINCT section FROM students ORDER BY section').all().map(r => r.section);
+  const classes = (await db.prepare('SELECT DISTINCT class FROM students ORDER BY class').all()).map(r => r.class);
+  const sections = (await db.prepare('SELECT DISTINCT section FROM students ORDER BY section').all()).map(r => r.section);
   const counts = { present: 0, absent: 0, late: 0, leave: 0, unmarked: 0 };
   for (const r of roster) { if (r.att) counts[r.att]++; else counts.unmarked++; }
   ok(res, { roster, classes, sections, counts, date, locked, lockedClass: locked ? locked.class : null, lockedSection: locked ? locked.section : null });
 });
 route('POST', '/api/attendance/save', async (req, res) => {
-  const user = auth(req, res, ['admin', 'teacher', 'manager', 'staff']);
+  const user = await auth(req, res, ['admin', 'teacher', 'manager', 'staff']);
   if (!user) return;
   const body = await readBody(req);
   const date = body.date || todayStr();
@@ -620,53 +629,53 @@ route('POST', '/api/attendance/save', async (req, res) => {
   // class teachers may only mark attendance for their own class
   if (user.role === 'teacher') {
     if (kind !== 'student') return fail(res, 403, 'Teachers can only mark student attendance');
-    const assign = teacherAssignment(user);
+    const assign = await teacherAssignment(user);
     if (!assign) return fail(res, 403, 'You are not assigned to any class yet. Contact the administrator.');
     const ids = body.records.map(r => r.ref_id).filter(Boolean);
     if (ids.length) {
       const placeholders = ids.map(() => '?').join(',');
-      const bad = db.prepare(`SELECT COUNT(*) c FROM students WHERE id IN (${placeholders}) AND (class<>? OR section<>?)`).get(...ids, assign.class, assign.section);
+      const bad = await db.prepare(`SELECT COUNT(*) c FROM students WHERE id IN (${placeholders}) AND (class<>? OR section<>?)`).get(...ids, assign.class, assign.section);
       if (bad.c > 0) return fail(res, 403, 'You can only mark attendance for your assigned class');
     }
   }
   let saved = 0;
-  db.exec('BEGIN');
+  const stmts = [];
+  for (const rec of body.records) {
+    if (!rec.ref_id || !rec.status) continue;
+    stmts.push({ sql: `INSERT INTO attendance (date,kind,ref_id,status) VALUES (?,?,?,?)
+        ON CONFLICT(date,kind,ref_id) DO UPDATE SET status=excluded.status`, args: [date, kind, rec.ref_id, rec.status] });
+    saved++;
+  }
   try {
-    for (const rec of body.records) {
-      if (!rec.ref_id || !rec.status) continue;
-      db.prepare(`INSERT INTO attendance (date,kind,ref_id,status) VALUES (?,?,?,?)
-        ON CONFLICT(date,kind,ref_id) DO UPDATE SET status=excluded.status`).run(date, kind, rec.ref_id, rec.status);
-      saved++;
-    }
-    db.exec('COMMIT');
+    if (stmts.length) await db.batch(stmts);
     ok(res, { saved });
-  } catch (e) { db.exec('ROLLBACK'); fail(res, 400, e.message); }
+  } catch (e) { fail(res, 400, e.message); }
 });
-route('GET', '/api/attendance/trend', (req, res) => {
-  const user = auth(req, res, null);
+route('GET', '/api/attendance/trend', async (req, res) => {
+  const user = await auth(req, res, null);
   if (!user) return;
   const u = new URL(req.url, 'http://x');
   const days = Math.min(Number(u.searchParams.get('days') || 7), 30);
-  const denomS = Math.max(db.prepare("SELECT COUNT(*) c FROM students WHERE status='active'").get().c, 1);
-  const denomE = Math.max(db.prepare("SELECT COUNT(*) c FROM employees WHERE status='active'").get().c, 1);
+  const denomS = Math.max((await db.prepare("SELECT COUNT(*) c FROM students WHERE status='active'").get()).c, 1);
+  const denomE = Math.max((await db.prepare("SELECT COUNT(*) c FROM employees WHERE status='active'").get()).c, 1);
   const out = [];
   for (let i = days - 1; i >= 0; i--) {
     const d = new Date(); d.setDate(d.getDate() - i);
     const ds = `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}-${String(d.getDate()).padStart(2, '0')}`;
-    const s = db.prepare("SELECT status, COUNT(*) c FROM attendance WHERE date=? AND kind='student' GROUP BY status").all(ds);
-    const e = db.prepare("SELECT status, COUNT(*) c FROM attendance WHERE date=? AND kind='employee' GROUP BY status").all(ds);
+    const s = await db.prepare("SELECT status, COUNT(*) c FROM attendance WHERE date=? AND kind='student' GROUP BY status").all(ds);
+    const e = await db.prepare("SELECT status, COUNT(*) c FROM attendance WHERE date=? AND kind='employee' GROUP BY status").all(ds);
     const sum = (rows) => rows.filter(r => ['present', 'late'].includes(r.status)).reduce((a, r) => a + r.c, 0);
     out.push({ date: ds, label: ds.slice(5), studentsPct: Math.round(sum(s) / denomS * 100), staffPct: Math.round(sum(e) / denomE * 100) });
   }
   ok(res, { trend: out });
 });
-route('GET', '/api/attendance/student/:id', (req, res, params) => {
-  const user = auth(req, res, null);
+route('GET', '/api/attendance/student/:id', async (req, res, params) => {
+  const user = await auth(req, res, null);
   if (!user) return;
   const u = new URL(req.url, 'http://x');
   const days = Number(u.searchParams.get('days') || 30);
   const id = Number(params.id);
-  const rows = db.prepare("SELECT date, status FROM attendance WHERE kind='student' AND ref_id=? AND date >= ? ORDER BY date DESC").all(id, daysAgoStr(days));
+  const rows = await db.prepare("SELECT date, status FROM attendance WHERE kind='student' AND ref_id=? AND date >= ? ORDER BY date DESC").all(id, daysAgoStr(days));
   const total = rows.length;
   const attended = rows.filter(r => ['present', 'late'].includes(r.status)).length;
   ok(res, { records: rows, pct: total ? Math.round(attended / total * 100) : 100, total, attended });
@@ -674,40 +683,40 @@ route('GET', '/api/attendance/student/:id', (req, res, params) => {
 function daysAgoStr(n) { const d = new Date(); d.setDate(d.getDate() - n); return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}-${String(d.getDate()).padStart(2, '0')}`; }
 
 // ---- fees ----
-route('GET', '/api/fee-categories', (req, res) => {
-  const user = auth(req, res, null);
+route('GET', '/api/fee-categories', async (req, res) => {
+  const user = await auth(req, res, null);
   if (!user) return;
-  ok(res, { categories: db.prepare('SELECT * FROM fee_categories ORDER BY id').all() });
+  ok(res, { categories: await db.prepare('SELECT * FROM fee_categories ORDER BY id').all() });
 });
 route('POST', '/api/fee-categories', async (req, res) => {
-  const user = auth(req, res, ['admin', 'manager', 'staff']);
+  const user = await auth(req, res, ['admin', 'manager', 'staff']);
   if (!user) return;
   const b = await readBody(req);
   if (!b.name) return fail(res, 400, 'Category name required');
-  const r = db.prepare('INSERT INTO fee_categories (name,total_amount,installments,due_date,description) VALUES (?,?,?,?,?)')
+  const r = await db.prepare('INSERT INTO fee_categories (name,total_amount,installments,due_date,description) VALUES (?,?,?,?,?)')
     .run(b.name, Number(b.total_amount) || 0, Number(b.installments) || 1, b.due_date || '', b.description || '');
-  ok(res, { category: db.prepare('SELECT * FROM fee_categories WHERE id=?').get(Number(r.lastInsertRowid)) });
+  ok(res, { category: await db.prepare('SELECT * FROM fee_categories WHERE id=?').get(Number(r.lastInsertRowid)) });
 });
 route('PUT', '/api/fee-categories/:id', async (req, res, params) => {
-  const user = auth(req, res, ['admin', 'manager', 'staff']);
+  const user = await auth(req, res, ['admin', 'manager', 'staff']);
   if (!user) return;
   const b = await readBody(req);
-  db.prepare('UPDATE fee_categories SET name=?,total_amount=?,installments=?,due_date=?,description=? WHERE id=?')
+  await db.prepare('UPDATE fee_categories SET name=?,total_amount=?,installments=?,due_date=?,description=? WHERE id=?')
     .run(b.name, Number(b.total_amount) || 0, Number(b.installments) || 1, b.due_date || '', b.description || '', Number(params.id));
   ok(res, { ok: true });
 });
-route('DELETE', '/api/fee-categories/:id', (req, res, params) => {
-  const user = auth(req, res, ['admin', 'manager']);
+route('DELETE', '/api/fee-categories/:id', async (req, res, params) => {
+  const user = await auth(req, res, ['admin', 'manager']);
   if (!user) return;
-  db.prepare('DELETE FROM fee_categories WHERE id=?').run(Number(params.id));
+  await db.prepare('DELETE FROM fee_categories WHERE id=?').run(Number(params.id));
   ok(res, { ok: true });
 });
 
-function feeStatusList(search, statusFilter) {
-  const cats = db.prepare('SELECT * FROM fee_categories ORDER BY id').all();
+async function feeStatusList(search, statusFilter) {
+  const cats = await db.prepare('SELECT * FROM fee_categories ORDER BY id').all();
   const totalDue = cats.reduce((a, c) => a + c.total_amount, 0);
-  const students = db.prepare(`SELECT s.id,s.name,s.admission_no,s.class,s.section,s.roll_no FROM students s WHERE s.status='active' ORDER BY s.class,s.section,s.roll_no`).all();
-  const pays = db.prepare('SELECT student_id, category_id, COALESCE(SUM(amount + discount),0) total FROM payments GROUP BY student_id, category_id').all();
+  const students = await db.prepare(`SELECT s.id,s.name,s.admission_no,s.class,s.section,s.roll_no FROM students s WHERE s.status='active' ORDER BY s.class,s.section,s.roll_no`).all();
+  const pays = await db.prepare('SELECT student_id, category_id, COALESCE(SUM(amount + discount),0) total FROM payments GROUP BY student_id, category_id').all();
   const payMap = {};
   for (const p of pays) {
     payMap[p.student_id] = payMap[p.student_id] || {};
@@ -728,36 +737,36 @@ function feeStatusList(search, statusFilter) {
   if (statusFilter && statusFilter !== 'all') return out.filter(s => s.status === statusFilter);
   return out;
 }
-route('GET', '/api/fees', (req, res) => {
-  const user = auth(req, res, null);
+route('GET', '/api/fees', async (req, res) => {
+  const user = await auth(req, res, null);
   if (!user) return;
   const u = new URL(req.url, 'http://x');
   const search = (u.searchParams.get('search') || '').trim();
   const status = u.searchParams.get('status') || 'all';
-  const list = feeStatusList(search, status);
+  const list = await feeStatusList(search, status);
   const stats = {
-    totalCollected: db.prepare('SELECT COALESCE(SUM(amount),0) s FROM payments').get().s,
+    totalCollected: (await db.prepare('SELECT COALESCE(SUM(amount),0) s FROM payments').get()).s,
     paidStudents: list.filter(s => s.status === 'paid').length,
     pendingStudents: list.filter(s => s.status === 'pending').length,
     overdue: list.filter(s => s.status === 'overdue').length
   };
-  ok(res, { fees: list, stats, categories: db.prepare('SELECT id,name,total_amount FROM fee_categories').all() });
+  ok(res, { fees: list, stats, categories: await db.prepare('SELECT id,name,total_amount FROM fee_categories').all() });
 });
 route('POST', '/api/payments', async (req, res) => {
-  const user = auth(req, res, ['admin', 'manager', 'staff']);
+  const user = await auth(req, res, ['admin', 'manager', 'staff']);
   if (!user) return;
   const b = await readBody(req);
   if (!b.student_id) return fail(res, 400, 'Student required');
-  const student = db.prepare('SELECT * FROM students WHERE id=?').get(Number(b.student_id));
+  const student = await db.prepare('SELECT * FROM students WHERE id=?').get(Number(b.student_id));
   if (!student) return fail(res, 404, 'Student not found');
-  const receipt = genReceiptNo();
+  const receipt = await genReceiptNo();
   const date = b.date || todayStr();
-  db.prepare('INSERT INTO payments (receipt_no,student_id,category_id,amount,discount,mode,note,date) VALUES (?,?,?,?,?,?,?,?)')
+  await db.prepare('INSERT INTO payments (receipt_no,student_id,category_id,amount,discount,mode,note,date) VALUES (?,?,?,?,?,?,?,?)')
     .run(receipt, Number(b.student_id), b.category_id ? Number(b.category_id) : null, Number(b.amount) || 0, Number(b.discount) || 0, b.mode || 'cash', b.note || '', date);
-  ok(res, { payment: db.prepare('SELECT * FROM payments WHERE receipt_no=?').get(receipt) });
+  ok(res, { payment: await db.prepare('SELECT * FROM payments WHERE receipt_no=?').get(receipt) });
 });
-route('GET', '/api/payments', (req, res) => {
-  const user = auth(req, res, null);
+route('GET', '/api/payments', async (req, res) => {
+  const user = await auth(req, res, null);
   if (!user) return;
   const u = new URL(req.url, 'http://x');
   const limit = Math.min(Number(u.searchParams.get('limit') || 50), 200);
@@ -767,15 +776,15 @@ route('GET', '/api/payments', (req, res) => {
   if (search) { sql += ' WHERE s.name LIKE ? OR s.admission_no LIKE ? OR p.receipt_no LIKE ?'; args.push(`%${search}%`, `%${search}%`, `%${search}%`); }
   sql += ' ORDER BY p.id DESC LIMIT ?';
   args.push(limit);
-  ok(res, { payments: db.prepare(sql).all(...args) });
+  ok(res, { payments: await db.prepare(sql).all(...args) });
 });
-route('GET', '/api/fees/monthly-collection', (req, res) => {
-  const user = auth(req, res, null);
+route('GET', '/api/fees/monthly-collection', async (req, res) => {
+  const user = await auth(req, res, null);
   if (!user) return;
   const u = new URL(req.url, 'http://x');
   const months = Math.min(Number(u.searchParams.get('months') || 12), 24);
   const start = monthAgoStr(months - 1);
-  const rows = db.prepare("SELECT strftime('%Y-%m',date) m, COALESCE(SUM(amount),0) total FROM payments WHERE date >= ? GROUP BY m").all(start);
+  const rows = await db.prepare("SELECT strftime('%Y-%m',date) m, COALESCE(SUM(amount),0) total FROM payments WHERE date >= ? GROUP BY m").all(start);
   const map = Object.fromEntries(rows.map(r => [r.m, r.total]));
   const out = [];
   for (let i = months - 1; i >= 0; i--) {
@@ -785,12 +794,12 @@ route('GET', '/api/fees/monthly-collection', (req, res) => {
   ok(res, { data: out });
 });
 function monthAgoStr(n) { const d = new Date(); d.setDate(1); d.setMonth(d.getMonth() - n); return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}`; }
-route('GET', '/api/fees/overview', (req, res) => {
-  const user = auth(req, res, null);
+route('GET', '/api/fees/overview', async (req, res) => {
+  const user = await auth(req, res, null);
   if (!user) return;
-  const list = feeStatusList('', '');
+  const list = await feeStatusList('', '');
   ok(res, {
-    totalCollected: db.prepare('SELECT COALESCE(SUM(amount),0) s FROM payments').get().s,
+    totalCollected: (await db.prepare('SELECT COALESCE(SUM(amount),0) s FROM payments').get()).s,
     totalDue: list.length ? list[0].totalDue : 0,
     paidStudents: list.filter(s => s.status === 'paid').length,
     pendingStudents: list.filter(s => s.status === 'pending').length,
@@ -799,8 +808,8 @@ route('GET', '/api/fees/overview', (req, res) => {
 });
 
 // ---- exams & marks ----
-route('GET', '/api/exams', (req, res) => {
-  const user = auth(req, res, null);
+route('GET', '/api/exams', async (req, res) => {
+  const user = await auth(req, res, null);
   if (!user) return;
   const u = new URL(req.url, 'http://x');
   const search = (u.searchParams.get('search') || '').trim();
@@ -811,7 +820,7 @@ route('GET', '/api/exams', (req, res) => {
   const args = [];
   if (search) { sql += ' AND e.name LIKE ?'; args.push(`%${search}%`); }
   if (type) { sql += ' AND e.type=?'; args.push(type); }
-  const rows = db.prepare(sql).all(...args);
+  const rows = await db.prepare(sql).all(...args);
   const exams = rows.map(e => ({ ...e, exam_status: e.end_date < today ? 'completed' : (e.start_date > today ? 'upcoming' : 'ongoing') }));
   const filtered = status ? exams.filter(e => e.exam_status === status) : exams;
   const stats = {
@@ -823,45 +832,45 @@ route('GET', '/api/exams', (req, res) => {
   ok(res, { exams: filtered, stats, types: ['Unit Test', 'Half Yearly', 'Annual', 'Pre-Board', 'Mock'] });
 });
 route('POST', '/api/exams', async (req, res) => {
-  const user = auth(req, res, ['admin', 'teacher', 'manager']);
+  const user = await auth(req, res, ['admin', 'teacher', 'manager']);
   if (!user) return;
   const b = await readBody(req);
   if (!b.name) return fail(res, 400, 'Exam name required');
-  const r = db.prepare('INSERT INTO exams (name,type,class,section,start_date,end_date,total_marks,passing_marks) VALUES (?,?,?,?,?,?,?,?)')
+  const r = await db.prepare('INSERT INTO exams (name,type,class,section,start_date,end_date,total_marks,passing_marks) VALUES (?,?,?,?,?,?,?,?)')
     .run(b.name, b.type || 'Unit Test', b.class || '', b.section || '', b.start_date || '', b.end_date || '', Number(b.total_marks) || 100, Number(b.passing_marks) || 35);
-  ok(res, { exam: db.prepare('SELECT * FROM exams WHERE id=?').get(Number(r.lastInsertRowid)) });
+  ok(res, { exam: await db.prepare('SELECT * FROM exams WHERE id=?').get(Number(r.lastInsertRowid)) });
 });
 route('PUT', '/api/exams/:id', async (req, res, params) => {
-  const user = auth(req, res, ['admin', 'teacher', 'manager']);
+  const user = await auth(req, res, ['admin', 'teacher', 'manager']);
   if (!user) return;
   const b = await readBody(req);
-  db.prepare('UPDATE exams SET name=?,type=?,class=?,section=?,start_date=?,end_date=?,total_marks=?,passing_marks=? WHERE id=?')
+  await db.prepare('UPDATE exams SET name=?,type=?,class=?,section=?,start_date=?,end_date=?,total_marks=?,passing_marks=? WHERE id=?')
     .run(b.name, b.type || 'Unit Test', b.class || '', b.section || '', b.start_date || '', b.end_date || '', Number(b.total_marks) || 100, Number(b.passing_marks) || 35, Number(params.id));
   ok(res, { ok: true });
 });
-route('DELETE', '/api/exams/:id', (req, res, params) => {
-  const user = auth(req, res, ['admin', 'manager']);
+route('DELETE', '/api/exams/:id', async (req, res, params) => {
+  const user = await auth(req, res, ['admin', 'manager']);
   if (!user) return;
-  db.prepare('DELETE FROM exams WHERE id=?').run(Number(params.id));
-  db.prepare('DELETE FROM exam_marks WHERE exam_id=?').run(Number(params.id));
+  await db.prepare('DELETE FROM exams WHERE id=?').run(Number(params.id));
+  await db.prepare('DELETE FROM exam_marks WHERE exam_id=?').run(Number(params.id));
   ok(res, { ok: true });
 });
-route('GET', '/api/exams/:id/roster', (req, res, params) => {
-  const user = auth(req, res, null);
+route('GET', '/api/exams/:id/roster', async (req, res, params) => {
+  const user = await auth(req, res, null);
   if (!user) return;
-  const exam = db.prepare('SELECT * FROM exams WHERE id=?').get(Number(params.id));
+  const exam = await db.prepare('SELECT * FROM exams WHERE id=?').get(Number(params.id));
   if (!exam) return fail(res, 404, 'Exam not found');
-  const students = db.prepare(`SELECT id,name,admission_no,roll_no FROM students WHERE status='active' AND class=? AND section=? ORDER BY roll_no`).all(exam.class, exam.section);
+  const students = await db.prepare(`SELECT id,name,admission_no,roll_no FROM students WHERE status='active' AND class=? AND section=? ORDER BY roll_no`).all(exam.class, exam.section);
   ok(res, { exam, students });
 });
-route('GET', '/api/exams/:id/marks', (req, res, params) => {
-  const user = auth(req, res, null);
+route('GET', '/api/exams/:id/marks', async (req, res, params) => {
+  const user = await auth(req, res, null);
   if (!user) return;
-  const exam = db.prepare('SELECT * FROM exams WHERE id=?').get(Number(params.id));
+  const exam = await db.prepare('SELECT * FROM exams WHERE id=?').get(Number(params.id));
   if (!exam) return fail(res, 404, 'Exam not found');
-  const roster = db.prepare(`SELECT id,name,admission_no,roll_no FROM students WHERE status='active' AND class=? AND section=? ORDER BY roll_no`).all(exam.class, exam.section);
-  const subjects = db.prepare('SELECT * FROM subjects ORDER BY id').all();
-  const marksRows = db.prepare('SELECT student_id, subject_id, marks FROM exam_marks WHERE exam_id=?').all(exam.id);
+  const roster = await db.prepare(`SELECT id,name,admission_no,roll_no FROM students WHERE status='active' AND class=? AND section=? ORDER BY roll_no`).all(exam.class, exam.section);
+  const subjects = await db.prepare('SELECT * FROM subjects ORDER BY id').all();
+  const marksRows = await db.prepare('SELECT student_id, subject_id, marks FROM exam_marks WHERE exam_id=?').all(exam.id);
   const marks = {};
   for (const m of marksRows) {
     marks[m.subject_id] = marks[m.subject_id] || {};
@@ -870,35 +879,35 @@ route('GET', '/api/exams/:id/marks', (req, res, params) => {
   ok(res, { exam, roster, subjects, marks });
 });
 route('POST', '/api/exams/:id/marks', async (req, res, params) => {
-  const user = auth(req, res, ['admin', 'teacher', 'manager']);
+  const user = await auth(req, res, ['admin', 'teacher', 'manager']);
   if (!user) return;
   const b = await readBody(req);
   const examId = Number(params.id);
   const subjectId = Number(b.subject_id);
   if (!subjectId || !Array.isArray(b.rows)) return fail(res, 400, 'subject_id and rows required');
-  db.exec('BEGIN');
-  try {
-    for (const r of b.rows) {
-      if (r.student_id == null) continue;
-      const val = (r.marks === '' || r.marks == null) ? null : Number(r.marks);
-      if (val == null) {
-        db.prepare('DELETE FROM exam_marks WHERE exam_id=? AND student_id=? AND subject_id=?').run(examId, Number(r.student_id), subjectId);
-      } else {
-        db.prepare(`INSERT INTO exam_marks (exam_id,student_id,subject_id,marks) VALUES (?,?,?,?)
-          ON CONFLICT(exam_id,student_id,subject_id) DO UPDATE SET marks=excluded.marks`).run(examId, Number(r.student_id), subjectId, val);
-      }
+  const stmts = [];
+  for (const r of b.rows) {
+    if (r.student_id == null) continue;
+    const val = (r.marks === '' || r.marks == null) ? null : Number(r.marks);
+    if (val == null) {
+      stmts.push({ sql: 'DELETE FROM exam_marks WHERE exam_id=? AND student_id=? AND subject_id=?', args: [examId, Number(r.student_id), subjectId] });
+    } else {
+      stmts.push({ sql: `INSERT INTO exam_marks (exam_id,student_id,subject_id,marks) VALUES (?,?,?,?)
+          ON CONFLICT(exam_id,student_id,subject_id) DO UPDATE SET marks=excluded.marks`, args: [examId, Number(r.student_id), subjectId, val] });
     }
-    db.exec('COMMIT');
+  }
+  try {
+    if (stmts.length) await db.batch(stmts);
     ok(res, { ok: true });
-  } catch (e) { db.exec('ROLLBACK'); fail(res, 400, e.message); }
+  } catch (e) { fail(res, 400, e.message); }
 });
-route('GET', '/api/exams/:id/results', (req, res, params) => {
-  const user = auth(req, res, null);
+route('GET', '/api/exams/:id/results', async (req, res, params) => {
+  const user = await auth(req, res, null);
   if (!user) return;
-  const exam = db.prepare('SELECT * FROM exams WHERE id=?').get(Number(params.id));
+  const exam = await db.prepare('SELECT * FROM exams WHERE id=?').get(Number(params.id));
   if (!exam) return fail(res, 404, 'Exam not found');
-  const roster = db.prepare(`SELECT id,name,admission_no,roll_no,class,section FROM students WHERE status='active' AND class=? AND section=? ORDER BY roll_no`).all(exam.class, exam.section);
-  const marksRows = db.prepare(`SELECT m.student_id, m.subject_id, m.marks, s.name subject FROM exam_marks m JOIN subjects s ON s.id=m.subject_id WHERE m.exam_id=? ORDER BY m.subject_id`).all(exam.id);
+  const roster = await db.prepare(`SELECT id,name,admission_no,roll_no,class,section FROM students WHERE status='active' AND class=? AND section=? ORDER BY roll_no`).all(exam.class, exam.section);
+  const marksRows = await db.prepare(`SELECT m.student_id, m.subject_id, m.marks, s.name subject FROM exam_marks m JOIN subjects s ON s.id=m.subject_id WHERE m.exam_id=? ORDER BY m.subject_id`).all(exam.id);
   ok(res, buildResults(exam, roster, marksRows));
 });
 
@@ -931,26 +940,26 @@ function buildResults(exam, roster, marksRows) {
   return { exam, subjects, results, gradeScale: GRADE_SCALE, maxTotal };
 }
 
-route('GET', '/api/reportcard', (req, res) => {
-  const user = auth(req, res, null);
+route('GET', '/api/reportcard', async (req, res) => {
+  const user = await auth(req, res, null);
   if (!user) return;
   const u = new URL(req.url, 'http://x');
   const studentId = Number(u.searchParams.get('student_id'));
   const examId = Number(u.searchParams.get('exam_id'));
-  const student = db.prepare('SELECT s.*, p.name parent_name FROM students s LEFT JOIN parents p ON p.id=s.parent_id WHERE s.id=?').get(studentId);
-  const exam = db.prepare('SELECT * FROM exams WHERE id=?').get(examId);
+  const student = await db.prepare('SELECT s.*, p.name parent_name FROM students s LEFT JOIN parents p ON p.id=s.parent_id WHERE s.id=?').get(studentId);
+  const exam = await db.prepare('SELECT * FROM exams WHERE id=?').get(examId);
   if (!student || !exam) return fail(res, 404, 'Student or exam not found');
-  const roster = db.prepare(`SELECT id FROM students WHERE status='active' AND class=? AND section=?`).all(exam.class, exam.section);
-  const marksRows = db.prepare(`SELECT m.student_id, m.subject_id, m.marks, s.name subject FROM exam_marks m JOIN subjects s ON s.id=m.subject_id WHERE m.exam_id=? AND m.student_id=? ORDER BY m.subject_id`).all(examId, studentId);
+  const roster = await db.prepare(`SELECT id FROM students WHERE status='active' AND class=? AND section=?`).all(exam.class, exam.section);
+  const marksRows = await db.prepare(`SELECT m.student_id, m.subject_id, m.marks, s.name subject FROM exam_marks m JOIN subjects s ON s.id=m.subject_id WHERE m.exam_id=? AND m.student_id=? ORDER BY m.subject_id`).all(examId, studentId);
   const all = buildResults(exam, roster, marksRows);
   const mine = all.results.find(r => r.student.id === studentId);
-  const settings = getSettings();
+  const settings = await getSettings();
   ok(res, { student, exam, card: mine, gradeScale: all.gradeScale, maxTotal: all.maxTotal, school: settings.school, academic: settings.academic });
 });
 
 // ---- employees ----
-route('GET', '/api/employees', (req, res) => {
-  const user = auth(req, res, null);
+route('GET', '/api/employees', async (req, res) => {
+  const user = await auth(req, res, null);
   if (!user) return;
   const u = new URL(req.url, 'http://x');
   const search = (u.searchParams.get('search') || '').trim();
@@ -961,17 +970,17 @@ route('GET', '/api/employees', (req, res) => {
   if (type === 'teachers') sql += " AND e.type='teacher'";
   if (type === 'staff') sql += " AND e.type IN ('staff','admin')";
   sql += ' ORDER BY e.type, e.name';
-  const employees = db.prepare(sql).all(...args);
+  const employees = await db.prepare(sql).all(...args);
   const stat = {
-    total: db.prepare('SELECT COUNT(*) c FROM employees').get().c,
-    teachers: db.prepare("SELECT COUNT(*) c FROM employees WHERE type='teacher'").get().c,
-    salaryPaid: db.prepare("SELECT COALESCE(SUM(net),0) s FROM salaries WHERE status='paid'").get().s,
-    pending: db.prepare("SELECT COALESCE(SUM(net),0) s FROM salaries WHERE status='pending'").get().s
+    total: (await db.prepare('SELECT COUNT(*) c FROM employees').get()).c,
+    teachers: (await db.prepare("SELECT COUNT(*) c FROM employees WHERE type='teacher'").get()).c,
+    salaryPaid: (await db.prepare("SELECT COALESCE(SUM(net),0) s FROM salaries WHERE status='paid'").get()).s,
+    pending: (await db.prepare("SELECT COALESCE(SUM(net),0) s FROM salaries WHERE status='pending'").get()).s
   };
   ok(res, { employees, stats: stat });
 });
 route('POST', '/api/employees', async (req, res) => {
-  const user = auth(req, res, ['admin', 'manager']);
+  const user = await auth(req, res, ['admin', 'manager']);
   if (!user) return;
   const b = await readBody(req);
   if (!b.name) return fail(res, 400, 'Employee name required');
@@ -984,10 +993,10 @@ route('POST', '/api/employees', async (req, res) => {
     phone = normalizeMobile(b.phone);
   }
   const uid = has(b.unique_id) ? String(b.unique_id).trim() : '';
-  if (uid && db.prepare('SELECT 1 x FROM employees WHERE unique_id=? COLLATE NOCASE').get(uid)) return fail(res, 400, 'This Unique ID is already used by another employee');
-  const code = b.code || genEmpCode();
-  if (db.prepare('SELECT 1 x FROM employees WHERE code=?').get(code)) return fail(res, 400, 'Employee code already exists');
-  const r = db.prepare(`INSERT INTO employees
+  if (uid && await db.prepare('SELECT 1 x FROM employees WHERE unique_id=? COLLATE NOCASE').get(uid)) return fail(res, 400, 'This Unique ID is already used by another employee');
+  const code = b.code || await genEmpCode();
+  if (await db.prepare('SELECT 1 x FROM employees WHERE code=?').get(code)) return fail(res, 400, 'Employee code already exists');
+  const r = await db.prepare(`INSERT INTO employees
     (code,name,type,designation,department,phone,email,salary,join_date,address,home_class,home_section,status,
      unique_id,guardian_name,guardian_relation,aadhar_no,pan_no,highest_qualification,core_subject,driving_license)
     VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`)
@@ -999,28 +1008,28 @@ route('POST', '/api/employees', async (req, res) => {
   const empId = Number(r.lastInsertRowid);
   // auto-create the staff/teacher login: username = employee code, password = code@123
   let login = null;
-  if (!db.prepare('SELECT 1 x FROM users WHERE username=? COLLATE NOCASE').get(code)) {
+  if (!await db.prepare('SELECT 1 x FROM users WHERE username=? COLLATE NOCASE').get(code)) {
     const role = b.type === 'teacher' ? 'teacher' : b.type === 'admin' ? 'admin' : 'staff';
-    db.prepare('INSERT INTO users (username,password_hash,role,linked_type,linked_id,status,force_password_change) VALUES (?,?,?,?,?,?,1)')
+    await db.prepare('INSERT INTO users (username,password_hash,role,linked_type,linked_id,status,force_password_change) VALUES (?,?,?,?,?,?,1)')
       .run(code, hashPassword(code + '@123'), role, 'employee', empId, 'active');
     login = code + '@123';
   }
-  ok(res, { employee: db.prepare('SELECT * FROM employees WHERE id=?').get(empId), loginUsername: code, defaultPassword: login });
+  ok(res, { employee: await db.prepare('SELECT * FROM employees WHERE id=?').get(empId), loginUsername: code, defaultPassword: login });
 });
-route('GET', '/api/employees/:id', (req, res, params) => {
-  const user = auth(req, res, null);
+route('GET', '/api/employees/:id', async (req, res, params) => {
+  const user = await auth(req, res, null);
   if (!user) return;
-  const employee = db.prepare('SELECT * FROM employees WHERE id=?').get(Number(params.id));
+  const employee = await db.prepare('SELECT * FROM employees WHERE id=?').get(Number(params.id));
   if (!employee) return fail(res, 404, 'Employee not found');
-  const salaries = db.prepare('SELECT * FROM salaries WHERE employee_id=? ORDER BY month DESC').all(employee.id);
-  const login = db.prepare("SELECT id, username, role, status FROM users WHERE linked_type='employee' AND linked_id=?").get(employee.id);
+  const salaries = await db.prepare('SELECT * FROM salaries WHERE employee_id=? ORDER BY month DESC').all(employee.id);
+  const login = await db.prepare("SELECT id, username, role, status FROM users WHERE linked_type='employee' AND linked_id=?").get(employee.id);
   ok(res, { employee, salaries, login });
 });
 route('PUT', '/api/employees/:id', async (req, res, params) => {
-  const user = auth(req, res, ['admin', 'manager']);
+  const user = await auth(req, res, ['admin', 'manager']);
   if (!user) return;
   const b = await readBody(req);
-  const existing = db.prepare('SELECT * FROM employees WHERE id=?').get(Number(params.id));
+  const existing = await db.prepare('SELECT * FROM employees WHERE id=?').get(Number(params.id));
   if (!existing) return fail(res, 404, 'Employee not found');
   const has = (v) => v != null && String(v).trim() !== '';
   let phone = b.phone || existing.phone || '';
@@ -1030,8 +1039,8 @@ route('PUT', '/api/employees/:id', async (req, res, params) => {
     phone = normalizeMobile(b.phone);
   }
   const uid = has(b.unique_id) ? String(b.unique_id).trim() : (existing.unique_id || '');
-  if (uid && db.prepare('SELECT 1 x FROM employees WHERE unique_id=? COLLATE NOCASE AND id<>?').get(uid, Number(params.id))) return fail(res, 400, 'This Unique ID is already used by another employee');
-  db.prepare(`UPDATE employees SET name=?,type=?,designation=?,department=?,phone=?,email=?,salary=?,join_date=?,address=?,home_class=?,home_section=?,status=?,
+  if (uid && await db.prepare('SELECT 1 x FROM employees WHERE unique_id=? COLLATE NOCASE AND id<>?').get(uid, Number(params.id))) return fail(res, 400, 'This Unique ID is already used by another employee');
+  await db.prepare(`UPDATE employees SET name=?,type=?,designation=?,department=?,phone=?,email=?,salary=?,join_date=?,address=?,home_class=?,home_section=?,status=?,
     unique_id=?,guardian_name=?,guardian_relation=?,aadhar_no=?,pan_no=?,highest_qualification=?,core_subject=?,driving_license=? WHERE id=?`)
     .run(b.name, b.type || 'staff', b.designation || '', b.department || '', phone, b.email || '', Number(b.salary) || 0, b.join_date || '', b.address || '', b.home_class || '', b.home_section || '', b.status || 'active',
       uid, has(b.guardian_name) ? String(b.guardian_name).trim() : (existing.guardian_name || ''), has(b.guardian_relation) ? String(b.guardian_relation).trim() : (existing.guardian_relation || ''),
@@ -1040,22 +1049,22 @@ route('PUT', '/api/employees/:id', async (req, res, params) => {
       has(b.driving_license) ? String(b.driving_license).trim() : (existing.driving_license || ''), Number(params.id));
   ok(res, { ok: true });
 });
-route('DELETE', '/api/employees/:id', (req, res, params) => {
-  const user = auth(req, res, ['admin', 'manager']);
+route('DELETE', '/api/employees/:id', async (req, res, params) => {
+  const user = await auth(req, res, ['admin', 'manager']);
   if (!user) return;
-  db.prepare('DELETE FROM employees WHERE id=?').run(Number(params.id));
+  await db.prepare('DELETE FROM employees WHERE id=?').run(Number(params.id));
   ok(res, { ok: true });
 });
-route('GET', '/api/employees/export/csv', (req, res) => {
-  const user = auth(req, res, null);
+route('GET', '/api/employees/export/csv', async (req, res) => {
+  const user = await auth(req, res, null);
   if (!user) return;
-  const rows = db.prepare('SELECT code,name,type,designation,department,phone,email,salary,join_date,address,status FROM employees ORDER BY code').all();
+  const rows = await db.prepare('SELECT code,name,type,designation,department,phone,email,salary,join_date,address,status FROM employees ORDER BY code').all();
   const csv = toCSV([['Code','Name','Type','Designation','Department','Phone','Email','Salary','Join Date','Address','Status'], ...rows.map(r => Object.values(r))]);
   res.writeHead(200, { 'Content-Type': 'text/csv', 'Content-Disposition': 'attachment; filename="employees.csv"' });
   res.end(csv);
 });
 route('POST', '/api/employees/import', async (req, res) => {
-  const user = auth(req, res, ['admin', 'manager']);
+  const user = await auth(req, res, ['admin', 'manager']);
   if (!user) return;
   const body = await readBody(req);
   const rows = parseCSV(body.csv || '');
@@ -1065,78 +1074,73 @@ route('POST', '/api/employees/import', async (req, res) => {
   const map = { code: idx('code'), name: idx('name'), type: idx('type'), designation: idx('designation'), department: idx('department'), phone: idx('phone'), email: idx('email'), salary: idx('salary'), join: idx('join date') };
   if (map.name < 0) return fail(res, 400, 'CSV must include a "Name" column');
   let created = 0, skipped = 0, logins = 0;
-  db.exec('BEGIN');
   try {
     for (const r of rows.slice(1)) {
       const name = (r[map.name] || '').trim();
       if (!name) { skipped++; continue; }
-      const code = (r[map.code] || '').trim() || genEmpCode();
-      if (db.prepare('SELECT 1 x FROM employees WHERE code=?').get(code)) { skipped++; continue; }
+      const code = (r[map.code] || '').trim() || await genEmpCode();
+      if (await db.prepare('SELECT 1 x FROM employees WHERE code=?').get(code)) { skipped++; continue; }
       const type = (r[map.type] || 'staff').trim().toLowerCase();
-      const er = db.prepare('INSERT INTO employees (code,name,type,designation,department,phone,email,salary,join_date,status) VALUES (?,?,?,?,?,?,?,?,?,?)')
-        .run(code, name, type, (r[map.designation] || '').trim(), (r[map.department] || '').trim(), (r[map.phone] || '').trim(), (r[map.email] || '').trim(), Number(r[map.salary]) || 0, (r[map.join] || '').trim(), 'active');
+      const er = await db.batch([{ sql: 'INSERT INTO employees (code,name,type,designation,department,phone,email,salary,join_date,status) VALUES (?,?,?,?,?,?,?,?,?,?)', args: [code, name, type, (r[map.designation] || '').trim(), (r[map.department] || '').trim(), (r[map.phone] || '').trim(), (r[map.email] || '').trim(), Number(r[map.salary]) || 0, (r[map.join] || '').trim(), 'active'] }]);
       // every employee gets a login: username = employee code, password = code@123
-      if (!db.prepare('SELECT 1 x FROM users WHERE username=? COLLATE NOCASE').get(code)) {
+      if (!await db.prepare('SELECT 1 x FROM users WHERE username=? COLLATE NOCASE').get(code)) {
         const role = type === 'teacher' ? 'teacher' : type === 'admin' ? 'admin' : 'staff';
-        db.prepare('INSERT INTO users (username,password_hash,role,linked_type,linked_id,status,force_password_change) VALUES (?,?,?,?,?,?,1)')
-          .run(code, hashPassword(code + '@123'), role, 'employee', Number(er.lastInsertRowid), 'active');
+        await db.batch([{ sql: 'INSERT INTO users (username,password_hash,role,linked_type,linked_id,status,force_password_change) VALUES (?,?,?,?,?,?,1)', args: [code, hashPassword(code + '@123'), role, 'employee', er.lastInsertRowid, 'active'] }]);
         logins++;
       }
       created++;
     }
-    db.exec('COMMIT');
     ok(res, { created, skipped, logins });
-  } catch (e) { db.exec('ROLLBACK'); fail(res, 400, 'Import failed: ' + e.message); }
+  } catch (e) { fail(res, 400, 'Import failed: ' + e.message); }
 });
 
 // ---- salaries ----
-route('GET', '/api/salaries', (req, res) => {
-  const user = auth(req, res, null);
+route('GET', '/api/salaries', async (req, res) => {
+  const user = await auth(req, res, null);
   if (!user) return;
   const u = new URL(req.url, 'http://x');
   const month = u.searchParams.get('month') || monthAgoStr(0);
-  const employees = db.prepare("SELECT * FROM employees WHERE status='active' ORDER BY type, name").all();
+  const employees = await db.prepare("SELECT * FROM employees WHERE status='active' ORDER BY type, name").all();
   // ensure salary rows exist for this month
-  db.exec('BEGIN');
   try {
+    const stmts = [];
     for (const e of employees) {
-      const exists = db.prepare('SELECT 1 x FROM salaries WHERE employee_id=? AND month=?').get(e.id, month);
+      const exists = await db.prepare('SELECT 1 x FROM salaries WHERE employee_id=? AND month=?').get(e.id, month);
       if (!exists) {
         const basic = e.salary, allow = Math.round(basic * 0.12), ded = Math.round(basic * 0.08);
-        db.prepare('INSERT INTO salaries (employee_id,month,basic,allowances,deductions,net,status) VALUES (?,?,?,?,?,?,?)')
-          .run(e.id, month, basic, allow, ded, basic + allow - ded, 'pending');
+        stmts.push({ sql: 'INSERT INTO salaries (employee_id,month,basic,allowances,deductions,net,status) VALUES (?,?,?,?,?,?,?)', args: [e.id, month, basic, allow, ded, basic + allow - ded, 'pending'] });
       }
     }
-    db.exec('COMMIT');
-  } catch (e) { db.exec('ROLLBACK'); }
-  const rows = db.prepare(`SELECT s.*, e.name, e.code, e.type, e.designation FROM salaries s JOIN employees e ON e.id=s.employee_id WHERE s.month=? ORDER BY e.type, e.name`).all(month);
+    if (stmts.length) await db.batch(stmts);
+  } catch (e) { /* salaries are best-effort; the read below still works */ }
+  const rows = await db.prepare(`SELECT s.*, e.name, e.code, e.type, e.designation FROM salaries s JOIN employees e ON e.id=s.employee_id WHERE s.month=? ORDER BY e.type, e.name`).all(month);
   const paid = rows.filter(r => r.status === 'paid').reduce((a, r) => a + r.net, 0);
   const pending = rows.filter(r => r.status === 'pending').reduce((a, r) => a + r.net, 0);
   ok(res, { salaries: rows, month, stats: { total: rows.length, paidCount: rows.filter(r => r.status === 'paid').length, pendingCount: rows.filter(r => r.status === 'pending').length, paid, pending } });
 });
 route('POST', '/api/salaries/pay', async (req, res) => {
-  const user = auth(req, res, ['admin', 'manager']);
+  const user = await auth(req, res, ['admin', 'manager']);
   if (!user) return;
   const b = await readBody(req);
-  const r = db.prepare("UPDATE salaries SET status='paid', paid_date=? WHERE employee_id=? AND month=?").run(todayStr(), Number(b.employee_id), b.month);
+  const r = await db.prepare("UPDATE salaries SET status='paid', paid_date=? WHERE employee_id=? AND month=?").run(todayStr(), Number(b.employee_id), b.month);
   ok(res, { ok: r.changes > 0 });
 });
 
 // ---- notifications ----
-route('GET', '/api/notifications', (req, res) => {
-  const user = auth(req, res, null);
+route('GET', '/api/notifications', async (req, res) => {
+  const user = await auth(req, res, null);
   if (!user) return;
   const u = new URL(req.url, 'http://x');
   const filter = u.searchParams.get('filter') || 'all';
-  const all = db.prepare('SELECT n.*, u.username creator_name FROM notifications n LEFT JOIN users u ON u.id=n.created_by ORDER BY n.id DESC').all()
+  const all = (await db.prepare('SELECT n.*, u.username creator_name FROM notifications n LEFT JOIN users u ON u.id=n.created_by ORDER BY n.id DESC').all())
     .filter(n => audienceMatches(n.audience, user.role));
-  const readIds = new Set(db.prepare('SELECT notification_id FROM notification_reads WHERE user_id=?').all(user.id).map(r => r.notification_id));
+  const readIds = new Set((await db.prepare('SELECT notification_id FROM notification_reads WHERE user_id=?').all(user.id)).map(r => r.notification_id));
   const list = all.map(n => ({ ...n, read: readIds.has(n.id) }));
   const out = filter === 'unread' ? list.filter(n => !n.read) : list;
   ok(res, { notifications: out, unreadCount: list.filter(n => !n.read).length });
 });
 route('POST', '/api/notifications', async (req, res) => {
-  const user = auth(req, res, ['admin', 'manager', 'teacher', 'staff']);
+  const user = await auth(req, res, ['admin', 'manager', 'teacher', 'staff']);
   if (!user) return;
   const b = await readBody(req);
   if (!b.title || !b.message) return fail(res, 400, 'Title and message required');
@@ -1144,112 +1148,112 @@ route('POST', '/api/notifications', async (req, res) => {
   const audience = audiences.includes(b.audience) ? b.audience : 'all';
   const types = ['info', 'warning', 'success', 'urgent'];
   const type = types.includes(b.type) ? b.type : 'info';
-  const r = db.prepare('INSERT INTO notifications (title,message,type,audience,created_by) VALUES (?,?,?,?,?)')
+  const r = await db.prepare('INSERT INTO notifications (title,message,type,audience,created_by) VALUES (?,?,?,?,?)')
     .run(b.title, b.message, type, audience, user.id);
-  ok(res, { notification: db.prepare('SELECT * FROM notifications WHERE id=?').get(Number(r.lastInsertRowid)) });
+  ok(res, { notification: await db.prepare('SELECT * FROM notifications WHERE id=?').get(Number(r.lastInsertRowid)) });
 });
 route('PUT', '/api/notifications/:id', async (req, res, params) => {
-  const user = auth(req, res, ['admin']);
+  const user = await auth(req, res, ['admin']);
   if (!user) return;
   const b = await readBody(req);
-  db.prepare('UPDATE notifications SET title=?,message=?,type=?,audience=? WHERE id=?')
+  await db.prepare('UPDATE notifications SET title=?,message=?,type=?,audience=? WHERE id=?')
     .run(b.title, b.message, b.type || 'info', b.audience || 'all', Number(params.id));
   ok(res, { ok: true });
 });
-route('DELETE', '/api/notifications/:id', (req, res, params) => {
-  const user = auth(req, res, ['admin']);
+route('DELETE', '/api/notifications/:id', async (req, res, params) => {
+  const user = await auth(req, res, ['admin']);
   if (!user) return;
-  db.prepare('DELETE FROM notifications WHERE id=?').run(Number(params.id));
-  db.prepare('DELETE FROM notification_reads WHERE notification_id=?').run(Number(params.id));
+  await db.prepare('DELETE FROM notifications WHERE id=?').run(Number(params.id));
+  await db.prepare('DELETE FROM notification_reads WHERE notification_id=?').run(Number(params.id));
   ok(res, { ok: true });
 });
-route('POST', '/api/notifications/:id/read', (req, res, params) => {
-  const user = auth(req, res, null);
+route('POST', '/api/notifications/:id/read', async (req, res, params) => {
+  const user = await auth(req, res, null);
   if (!user) return;
-  db.prepare('INSERT OR IGNORE INTO notification_reads (notification_id,user_id) VALUES (?,?)').run(Number(params.id), user.id);
+  await db.prepare('INSERT OR IGNORE INTO notification_reads (notification_id,user_id) VALUES (?,?)').run(Number(params.id), user.id);
   ok(res, { ok: true });
 });
-route('POST', '/api/notifications/read-all', (req, res) => {
-  const user = auth(req, res, null);
+route('POST', '/api/notifications/read-all', async (req, res) => {
+  const user = await auth(req, res, null);
   if (!user) return;
-  const ids = db.prepare('SELECT id FROM notifications').all().filter(n => audienceMatches(n.audience, user.role)).map(n => n.id);
-  for (const id of ids) db.prepare('INSERT OR IGNORE INTO notification_reads (notification_id,user_id) VALUES (?,?)').run(id, user.id);
+  const ids = (await db.prepare('SELECT id FROM notifications').all()).filter(n => audienceMatches(n.audience, user.role)).map(n => n.id);
+  for (const id of ids) await db.prepare('INSERT OR IGNORE INTO notification_reads (notification_id,user_id) VALUES (?,?)').run(id, user.id);
   ok(res, { ok: true });
 });
-route('GET', '/api/notifications/unread-count', (req, res) => {
-  const user = auth(req, res, null);
+route('GET', '/api/notifications/unread-count', async (req, res) => {
+  const user = await auth(req, res, null);
   if (!user) return;
-  const all = db.prepare('SELECT id FROM notifications').all().filter(n => audienceMatches(n.audience, user.role));
-  const readIds = new Set(db.prepare('SELECT notification_id FROM notification_reads WHERE user_id=?').all(user.id).map(r => r.notification_id));
+  const all = (await db.prepare('SELECT id FROM notifications').all()).filter(n => audienceMatches(n.audience, user.role));
+  const readIds = new Set((await db.prepare('SELECT notification_id FROM notification_reads WHERE user_id=?').all(user.id)).map(r => r.notification_id));
   ok(res, { unreadCount: all.filter(n => !readIds.has(n.id)).length });
 });
 
 // ---- transport ----
-route('GET', '/api/routes', (req, res) => {
-  const user = auth(req, res, null);
+route('GET', '/api/routes', async (req, res) => {
+  const user = await auth(req, res, null);
   if (!user) return;
-  const rows = db.prepare(`SELECT r.*, e.name driver_name, e.phone driver_phone,
+  const rows = await db.prepare(`SELECT r.*, e.name driver_name, e.phone driver_phone,
     (SELECT COUNT(*) FROM students s WHERE s.route_id=r.id AND s.status='active') students_count
     FROM routes r LEFT JOIN employees e ON e.id=r.driver_id ORDER BY r.route_no`).all();
   const stats = {
     totalRoutes: rows.length,
     totalCapacity: rows.reduce((a, r) => a + r.capacity, 0),
-    studentsOnBus: db.prepare("SELECT COUNT(*) c FROM students WHERE route_id IS NOT NULL AND status='active'").get().c,
-    drivers: db.prepare("SELECT COUNT(*) c FROM employees WHERE type='driver' AND status='active'").get().c
+    studentsOnBus: (await db.prepare("SELECT COUNT(*) c FROM students WHERE route_id IS NOT NULL AND status='active'").get()).c,
+    drivers: (await db.prepare("SELECT COUNT(*) c FROM employees WHERE type='driver' AND status='active'").get()).c
   };
   ok(res, { routes: rows.map(r => ({ ...r, stops: JSON.parse(r.stops || '[]') })), stats });
 });
-route('GET', '/api/routes/:id', (req, res, params) => {
-  const user = auth(req, res, null);
+route('GET', '/api/routes/:id', async (req, res, params) => {
+  const user = await auth(req, res, null);
   if (!user) return;
-  const route = db.prepare(`SELECT r.*, e.name driver_name, e.phone driver_phone, e.email driver_email, e.code driver_code FROM routes r LEFT JOIN employees e ON e.id=r.driver_id WHERE r.id=?`).get(Number(params.id));
+  const route = await db.prepare(`SELECT r.*, e.name driver_name, e.phone driver_phone, e.email driver_email, e.code driver_code FROM routes r LEFT JOIN employees e ON e.id=r.driver_id WHERE r.id=?`).get(Number(params.id));
   if (!route) return fail(res, 404, 'Route not found');
   route.stops = JSON.parse(route.stops || '[]');
-  const students = db.prepare('SELECT id,name,admission_no,class,section FROM students WHERE route_id=? AND status=? ORDER BY class,roll_no').all(route.id, 'active');
-  const unassigned = db.prepare("SELECT id,name,admission_no,class,section FROM students WHERE route_id IS NULL AND status='active' ORDER BY class,roll_no").all();
+  const students = await db.prepare('SELECT id,name,admission_no,class,section FROM students WHERE route_id=? AND status=? ORDER BY class,roll_no').all(route.id, 'active');
+  const unassigned = await db.prepare("SELECT id,name,admission_no,class,section FROM students WHERE route_id IS NULL AND status='active' ORDER BY class,roll_no").all();
   ok(res, { route, students, unassigned });
 });
 route('POST', '/api/routes', async (req, res) => {
-  const user = auth(req, res, ['admin', 'manager']);
+  const user = await auth(req, res, ['admin', 'manager']);
   if (!user) return;
   const b = await readBody(req);
   if (!b.route_no) return fail(res, 400, 'Route number required');
-  const r = db.prepare('INSERT INTO routes (route_no,vehicle_no,capacity,monthly_fee,driver_id,stops) VALUES (?,?,?,?,?,?)')
+  const r = await db.prepare('INSERT INTO routes (route_no,vehicle_no,capacity,monthly_fee,driver_id,stops) VALUES (?,?,?,?,?,?)')
     .run(b.route_no, b.vehicle_no || '', Number(b.capacity) || 0, Number(b.monthly_fee) || 0, b.driver_id ? Number(b.driver_id) : null, JSON.stringify(b.stops || []));
-  ok(res, { route: db.prepare('SELECT * FROM routes WHERE id=?').get(Number(r.lastInsertRowid)) });
+  ok(res, { route: await db.prepare('SELECT * FROM routes WHERE id=?').get(Number(r.lastInsertRowid)) });
 });
 route('PUT', '/api/routes/:id', async (req, res, params) => {
-  const user = auth(req, res, ['admin', 'manager']);
+  const user = await auth(req, res, ['admin', 'manager']);
   if (!user) return;
   const b = await readBody(req);
-  db.prepare('UPDATE routes SET route_no=?,vehicle_no=?,capacity=?,monthly_fee=?,driver_id=?,stops=? WHERE id=?')
+  await db.prepare('UPDATE routes SET route_no=?,vehicle_no=?,capacity=?,monthly_fee=?,driver_id=?,stops=? WHERE id=?')
     .run(b.route_no, b.vehicle_no || '', Number(b.capacity) || 0, Number(b.monthly_fee) || 0, b.driver_id ? Number(b.driver_id) : null, JSON.stringify(b.stops || []), Number(params.id));
   ok(res, { ok: true });
 });
-route('DELETE', '/api/routes/:id', (req, res, params) => {
-  const user = auth(req, res, ['admin', 'manager']);
+route('DELETE', '/api/routes/:id', async (req, res, params) => {
+  const user = await auth(req, res, ['admin', 'manager']);
   if (!user) return;
-  db.prepare('DELETE FROM routes WHERE id=?').run(Number(params.id));
-  db.prepare('UPDATE students SET route_id=NULL WHERE route_id=?').run(Number(params.id));
+  await db.prepare('DELETE FROM routes WHERE id=?').run(Number(params.id));
+  await db.prepare('UPDATE students SET route_id=NULL WHERE route_id=?').run(Number(params.id));
   ok(res, { ok: true });
 });
 route('POST', '/api/routes/:id/assign', async (req, res, params) => {
-  const user = auth(req, res, ['admin', 'manager', 'staff']);
+  const user = await auth(req, res, ['admin', 'manager', 'staff']);
   if (!user) return;
   const b = await readBody(req);
-  if (b.student_id) db.prepare('UPDATE students SET route_id=? WHERE id=?').run(Number(params.id), Number(b.student_id));
-  else if (b.unassign) db.prepare('UPDATE students SET route_id=NULL WHERE id=?').run(Number(b.unassign));
+  if (b.student_id) await db.prepare('UPDATE students SET route_id=? WHERE id=?').run(Number(params.id), Number(b.student_id));
+  else if (b.unassign) await db.prepare('UPDATE students SET route_id=NULL WHERE id=?').run(Number(b.unassign));
   ok(res, { ok: true });
 });
-route('GET', '/api/drivers', (req, res) => {
-  const user = auth(req, res, null);
+route('GET', '/api/drivers', async (req, res) => {
+  const user = await auth(req, res, null);
   if (!user) return;
-  ok(res, { drivers: db.prepare("SELECT id,name,code,phone FROM employees WHERE type='driver' AND status='active'").all() });
+  ok(res, { drivers: await db.prepare("SELECT id,name,code,phone FROM employees WHERE type='driver' AND status='active'").all() });
 });
 
 // ---- users ----
-route('GET', '/api/users', (req, res) => {
-  const user = auth(req, res, ['admin']);
+route('GET', '/api/users', async (req, res) => {
+  const user = await auth(req, res, ['admin']);
   if (!user) return;
   const u = new URL(req.url, 'http://x');
   const role = u.searchParams.get('role') || '';
@@ -1259,64 +1263,64 @@ route('GET', '/api/users', (req, res) => {
   const args = [];
   if (role) { sql += ' AND u.role=?'; args.push(role); }
   sql += ' ORDER BY u.id';
-  const users = db.prepare(sql).all(...args);
+  const users = await db.prepare(sql).all(...args);
   const stats = {
-    total: db.prepare('SELECT COUNT(*) c FROM users').get().c,
-    admins: db.prepare("SELECT COUNT(*) c FROM users WHERE role='admin'").get().c,
-    teachers: db.prepare("SELECT COUNT(*) c FROM users WHERE role='teacher'").get().c,
-    parents: db.prepare("SELECT COUNT(*) c FROM users WHERE role='parent'").get().c,
-    managers: db.prepare("SELECT COUNT(*) c FROM users WHERE role='manager'").get().c
+    total: (await db.prepare('SELECT COUNT(*) c FROM users').get()).c,
+    admins: (await db.prepare("SELECT COUNT(*) c FROM users WHERE role='admin'").get()).c,
+    teachers: (await db.prepare("SELECT COUNT(*) c FROM users WHERE role='teacher'").get()).c,
+    parents: (await db.prepare("SELECT COUNT(*) c FROM users WHERE role='parent'").get()).c,
+    managers: (await db.prepare("SELECT COUNT(*) c FROM users WHERE role='manager'").get()).c
   };
   ok(res, { users, stats });
 });
 route('POST', '/api/users', async (req, res) => {
-  const user = auth(req, res, ['admin']);
+  const user = await auth(req, res, ['admin']);
   if (!user) return;
   const b = await readBody(req);
   if (!b.username || !b.role) return fail(res, 400, 'Username and role required');
-  if (db.prepare('SELECT 1 x FROM users WHERE username=?').get(b.username)) return fail(res, 400, 'Username already exists');
+  if (await db.prepare('SELECT 1 x FROM users WHERE username=?').get(b.username)) return fail(res, 400, 'Username already exists');
   const roles = ['admin', 'teacher', 'manager', 'staff', 'parent'];
   if (!roles.includes(b.role)) return fail(res, 400, 'Invalid role');
   const tempPass = b.password || `${b.username}@123`;
   if (String(tempPass).length < 6) return fail(res, 400, 'Password must be at least 6 characters');
-  const r = db.prepare('INSERT INTO users (username,password_hash,role,linked_type,linked_id,status,force_password_change) VALUES (?,?,?,?,?,?,1)')
+  const r = await db.prepare('INSERT INTO users (username,password_hash,role,linked_type,linked_id,status,force_password_change) VALUES (?,?,?,?,?,?,1)')
     .run(b.username, hashPassword(tempPass), b.role, b.linked_type || null, b.linked_id ? Number(b.linked_id) : null, b.status || 'active');
-  ok(res, { user: db.prepare('SELECT * FROM users WHERE id=?').get(Number(r.lastInsertRowid)), tempPassword: tempPass });
+  ok(res, { user: await db.prepare('SELECT * FROM users WHERE id=?').get(Number(r.lastInsertRowid)), tempPassword: tempPass });
 });
 route('PUT', '/api/users/:id', async (req, res, params) => {
-  const user = auth(req, res, ['admin']);
+  const user = await auth(req, res, ['admin']);
   if (!user) return;
   const b = await readBody(req);
-  const target = db.prepare('SELECT * FROM users WHERE id=?').get(Number(params.id));
+  const target = await db.prepare('SELECT * FROM users WHERE id=?').get(Number(params.id));
   if (!target) return fail(res, 404, 'User not found');
   if (target.id === user.id && b.status === 'deactivated') return fail(res, 400, 'You cannot deactivate your own account');
-  db.prepare('UPDATE users SET role=?,status=?,linked_type=?,linked_id=? WHERE id=?')
+  await db.prepare('UPDATE users SET role=?,status=?,linked_type=?,linked_id=? WHERE id=?')
     .run(b.role || target.role, b.status || target.status, b.linked_type != null ? b.linked_type : target.linked_type, b.linked_id ? Number(b.linked_id) : null, Number(params.id));
   ok(res, { ok: true });
 });
-route('DELETE', '/api/users/:id', (req, res, params) => {
-  const user = auth(req, res, ['admin']);
+route('DELETE', '/api/users/:id', async (req, res, params) => {
+  const user = await auth(req, res, ['admin']);
   if (!user) return;
-  const target = db.prepare('SELECT * FROM users WHERE id=?').get(Number(params.id));
+  const target = await db.prepare('SELECT * FROM users WHERE id=?').get(Number(params.id));
   if (!target) return fail(res, 404, 'User not found');
   if (target.id === user.id) return fail(res, 400, 'You cannot delete your own account');
-  db.prepare('DELETE FROM users WHERE id=?').run(Number(params.id));
+  await db.prepare('DELETE FROM users WHERE id=?').run(Number(params.id));
   ok(res, { ok: true });
 });
 route('POST', '/api/users/:id/reset-password', async (req, res, params) => {
-  const user = auth(req, res, ['admin']);
+  const user = await auth(req, res, ['admin']);
   if (!user) return;
-  const target = db.prepare('SELECT * FROM users WHERE id=?').get(Number(params.id));
+  const target = await db.prepare('SELECT * FROM users WHERE id=?').get(Number(params.id));
   if (!target) return fail(res, 404, 'User not found');
   let body = {};
   try { body = await readBody(req); } catch (e) { /* optional body */ }
   const tempPass = (body && body.password) || `${target.username}@123`;
   if (String(tempPass).length < 6) return fail(res, 400, 'Password must be at least 6 characters');
-  db.prepare('UPDATE users SET password_hash=?, force_password_change=1 WHERE id=?').run(hashPassword(tempPass), target.id);
+  await db.prepare('UPDATE users SET password_hash=?, force_password_change=1 WHERE id=?').run(hashPassword(tempPass), target.id);
   ok(res, { tempPassword: tempPass, username: target.username });
 });
 route('POST', '/api/users/import', async (req, res) => {
-  const user = auth(req, res, ['admin']);
+  const user = await auth(req, res, ['admin']);
   if (!user) return;
   const body = await readBody(req);
   const rows = parseCSV(body.csv || '');
@@ -1327,116 +1331,115 @@ route('POST', '/api/users/import', async (req, res) => {
   if (map.username < 0 || map.role < 0) return fail(res, 400, 'CSV must include "Username" and "Role" columns');
   let created = 0, skipped = 0;
   const roles = ['admin', 'teacher', 'manager', 'staff', 'parent'];
-  db.exec('BEGIN');
   try {
+    const stmts = [];
     for (const r of rows.slice(1)) {
       const username = (r[map.username] || '').trim();
       const role = (r[map.role] || '').trim().toLowerCase();
       if (!username || !roles.includes(role)) { skipped++; continue; }
-      if (db.prepare('SELECT 1 x FROM users WHERE username=?').get(username)) { skipped++; continue; }
+      if (await db.prepare('SELECT 1 x FROM users WHERE username=?').get(username)) { skipped++; continue; }
       let linkedType = null, linkedId = null;
       const ltype = (r[map.linkedType] || '').trim().toLowerCase();
       const lcode = (r[map.linkedCode] || '').trim();
-      if (ltype === 'employee' && lcode) { const e = db.prepare('SELECT id FROM employees WHERE code=?').get(lcode); if (e) { linkedType = 'employee'; linkedId = e.id; } }
-      if (ltype === 'parent' && lcode) { const p = db.prepare('SELECT id FROM parents WHERE name=? OR phone=?').get(lcode, lcode); if (p) { linkedType = 'parent'; linkedId = p.id; } }
-      db.prepare('INSERT INTO users (username,password_hash,role,linked_type,linked_id,status,force_password_change) VALUES (?,?,?,?,?,?,1)')
-        .run(username, hashPassword(genTempPassword()), role, linkedType, linkedId, 'active');
+      if (ltype === 'employee' && lcode) { const e = await db.prepare('SELECT id FROM employees WHERE code=?').get(lcode); if (e) { linkedType = 'employee'; linkedId = e.id; } }
+      if (ltype === 'parent' && lcode) { const p = await db.prepare('SELECT id FROM parents WHERE name=? OR phone=?').get(lcode, lcode); if (p) { linkedType = 'parent'; linkedId = p.id; } }
+      stmts.push({ sql: 'INSERT INTO users (username,password_hash,role,linked_type,linked_id,status,force_password_change) VALUES (?,?,?,?,?,?,1)', args: [username, hashPassword(genTempPassword()), role, linkedType, linkedId, 'active'] });
       created++;
     }
-    db.exec('COMMIT');
+    if (stmts.length) await db.batch(stmts);
     ok(res, { created, skipped });
-  } catch (e) { db.exec('ROLLBACK'); fail(res, 400, 'Import failed: ' + e.message); }
+  } catch (e) { fail(res, 400, 'Import failed: ' + e.message); }
 });
-route('GET', '/api/users/link-options', (req, res) => {
-  const user = auth(req, res, ['admin']);
+route('GET', '/api/users/link-options', async (req, res) => {
+  const user = await auth(req, res, ['admin']);
   if (!user) return;
   ok(res, {
-    employees: db.prepare("SELECT id,code,name,type FROM employees WHERE status='active' ORDER BY name").all(),
-    parents: db.prepare("SELECT id,name,phone FROM parents ORDER BY name").all()
+    employees: await db.prepare("SELECT id,code,name,type FROM employees WHERE status='active' ORDER BY name").all(),
+    parents: await db.prepare("SELECT id,name,phone FROM parents ORDER BY name").all()
   });
 });
 
 // ---- parent portal ----
-route('GET', '/api/parent/overview', (req, res) => {
-  const user = auth(req, res, ['parent']);
+route('GET', '/api/parent/overview', async (req, res) => {
+  const user = await auth(req, res, ['parent']);
   if (!user) return;
-  const parent = db.prepare('SELECT * FROM parents WHERE id=?').get(user.linked_id);
+  const parent = await db.prepare('SELECT * FROM parents WHERE id=?').get(user.linked_id);
   if (!parent) return fail(res, 404, 'Parent record not found');
-  const children = db.prepare(`SELECT s.*, r.route_no, r.vehicle_no FROM students s LEFT JOIN routes r ON r.id=s.route_id WHERE s.parent_id=? AND s.status='active'`).all(parent.id);
+  const children = await db.prepare(`SELECT s.*, r.route_no, r.vehicle_no FROM students s LEFT JOIN routes r ON r.id=s.route_id WHERE s.parent_id=? AND s.status='active'`).all(parent.id);
   const today = todayStr();
-  const out = children.map(c => {
-    const att = db.prepare("SELECT COUNT(*) c, COALESCE(SUM(CASE WHEN status IN ('present','late') THEN 1 ELSE 0 END),0) p FROM attendance WHERE kind='student' AND ref_id=? AND date >= ?").get(c.id, daysAgoStr(89));
-    const tod = db.prepare("SELECT status FROM attendance WHERE kind='student' AND ref_id=? AND date=?").get(c.id, today);
-    const totalDue = db.prepare('SELECT COALESCE(SUM(total_amount),0) s FROM fee_categories').get().s;
-    const paid = db.prepare('SELECT COALESCE(SUM(amount + discount),0) s FROM payments WHERE student_id=?').get(c.id).s;
-    const results = db.prepare(`SELECT COUNT(DISTINCT exam_id) c FROM exam_marks m JOIN exams e ON e.id=m.exam_id WHERE m.student_id=? AND e.end_date < ?`).get(c.id, today).c;
+  const out = await Promise.all(children.map(async c => {
+    const att = await db.prepare("SELECT COUNT(*) c, COALESCE(SUM(CASE WHEN status IN ('present','late') THEN 1 ELSE 0 END),0) p FROM attendance WHERE kind='student' AND ref_id=? AND date >= ?").get(c.id, daysAgoStr(89));
+    const tod = await db.prepare("SELECT status FROM attendance WHERE kind='student' AND ref_id=? AND date=?").get(c.id, today);
+    const totalDue = (await db.prepare('SELECT COALESCE(SUM(total_amount),0) s FROM fee_categories').get()).s;
+    const paid = (await db.prepare('SELECT COALESCE(SUM(amount + discount),0) s FROM payments WHERE student_id=?').get(c.id)).s;
+    const results = (await db.prepare(`SELECT COUNT(DISTINCT exam_id) c FROM exam_marks m JOIN exams e ON e.id=m.exam_id WHERE m.student_id=? AND e.end_date < ?`).get(c.id, today)).c;
     return {
       ...c, attendancePct: att.c ? Math.round(att.p / att.c * 100) : 100, todayStatus: tod ? tod.status : null,
       feesPaid: paid, feesBalance: Math.max(0, totalDue - paid), hasResults: results > 0
     };
-  });
-  const unread = db.prepare(`SELECT COUNT(*) c FROM notifications n WHERE (n.audience='all' OR n.audience='parents')
-    AND NOT EXISTS (SELECT 1 FROM notification_reads nr WHERE nr.notification_id=n.id AND nr.user_id=?)`).get(user.id).c;
+  }));
+  const unread = (await db.prepare(`SELECT COUNT(*) c FROM notifications n WHERE (n.audience='all' OR n.audience='parents')
+    AND NOT EXISTS (SELECT 1 FROM notification_reads nr WHERE nr.notification_id=n.id AND nr.user_id=?)`).get(user.id)).c;
   ok(res, { parent, children: out, unread });
 });
-route('GET', '/api/parent/children/:id/attendance', (req, res, params) => {
-  const user = auth(req, res, ['parent']);
+route('GET', '/api/parent/children/:id/attendance', async (req, res, params) => {
+  const user = await auth(req, res, ['parent']);
   if (!user) return;
-  const owned = db.prepare('SELECT 1 x FROM students WHERE id=? AND parent_id=?').get(Number(params.id), user.linked_id);
+  const owned = await db.prepare('SELECT 1 x FROM students WHERE id=? AND parent_id=?').get(Number(params.id), user.linked_id);
   if (!owned) return fail(res, 403, 'Not your child');
   const u = new URL(req.url, 'http://x');
   const days = Math.min(Number(u.searchParams.get('days') || 60), 180);
-  const records = db.prepare("SELECT date, status FROM attendance WHERE kind='student' AND ref_id=? AND date >= ? ORDER BY date DESC").all(Number(params.id), daysAgoStr(days));
+  const records = await db.prepare("SELECT date, status FROM attendance WHERE kind='student' AND ref_id=? AND date >= ? ORDER BY date DESC").all(Number(params.id), daysAgoStr(days));
   ok(res, { records });
 });
-route('GET', '/api/parent/children/:id/fees', (req, res, params) => {
-  const user = auth(req, res, ['parent']);
+route('GET', '/api/parent/children/:id/fees', async (req, res, params) => {
+  const user = await auth(req, res, ['parent']);
   if (!user) return;
-  const owned = db.prepare('SELECT 1 x FROM students WHERE id=? AND parent_id=?').get(Number(params.id), user.linked_id);
+  const owned = await db.prepare('SELECT 1 x FROM students WHERE id=? AND parent_id=?').get(Number(params.id), user.linked_id);
   if (!owned) return fail(res, 403, 'Not your child');
-  const payments = db.prepare('SELECT * FROM payments WHERE student_id=? ORDER BY date DESC, id DESC').all(Number(params.id));
-  const totalDue = db.prepare('SELECT COALESCE(SUM(total_amount),0) s FROM fee_categories').get().s;
+  const payments = await db.prepare('SELECT * FROM payments WHERE student_id=? ORDER BY date DESC, id DESC').all(Number(params.id));
+  const totalDue = (await db.prepare('SELECT COALESCE(SUM(total_amount),0) s FROM fee_categories').get()).s;
   const paid = payments.reduce((a, p) => a + p.amount + p.discount, 0);
   ok(res, { payments, totalDue, paid, balance: Math.max(0, totalDue - paid) });
 });
-route('GET', '/api/parent/children/:id/results', (req, res, params) => {
-  const user = auth(req, res, ['parent']);
+route('GET', '/api/parent/children/:id/results', async (req, res, params) => {
+  const user = await auth(req, res, ['parent']);
   if (!user) return;
-  const owned = db.prepare('SELECT 1 x FROM students WHERE id=? AND parent_id=?').get(Number(params.id), user.linked_id);
+  const owned = await db.prepare('SELECT 1 x FROM students WHERE id=? AND parent_id=?').get(Number(params.id), user.linked_id);
   if (!owned) return fail(res, 403, 'Not your child');
   const today = todayStr();
-  const exams = db.prepare('SELECT DISTINCT e.* FROM exam_marks m JOIN exams e ON e.id=m.exam_id WHERE m.student_id=? AND e.end_date < ? ORDER BY e.end_date DESC').all(Number(params.id), today);
-  const list = exams.map(exam => {
-    const roster = db.prepare('SELECT id FROM students WHERE status=? AND class=? AND section=?').all('active', exam.class, exam.section);
-    const marksRows = db.prepare(`SELECT m.student_id, m.subject_id, m.marks, s.name subject FROM exam_marks m JOIN subjects s ON s.id=m.subject_id WHERE m.exam_id=? AND m.student_id=? ORDER BY m.subject_id`).all(exam.id, Number(params.id));
+  const exams = await db.prepare('SELECT DISTINCT e.* FROM exam_marks m JOIN exams e ON e.id=m.exam_id WHERE m.student_id=? AND e.end_date < ? ORDER BY e.end_date DESC').all(Number(params.id), today);
+  const list = await Promise.all(exams.map(async exam => {
+    const roster = await db.prepare('SELECT id FROM students WHERE status=? AND class=? AND section=?').all('active', exam.class, exam.section);
+    const marksRows = await db.prepare(`SELECT m.student_id, m.subject_id, m.marks, s.name subject FROM exam_marks m JOIN subjects s ON s.id=m.subject_id WHERE m.exam_id=? AND m.student_id=? ORDER BY m.subject_id`).all(exam.id, Number(params.id));
     const built = buildResults(exam, roster, marksRows);
     return { exam, card: built.results.find(r => r.student.id === Number(params.id)), gradeScale: built.gradeScale, maxTotal: built.maxTotal };
-  });
+  }));
   ok(res, { results: list });
 });
 
 // ---- settings ----
-route('GET', '/api/settings', (req, res) => {
-  const user = auth(req, res, null);
+route('GET', '/api/settings', async (req, res) => {
+  const user = await auth(req, res, null);
   if (!user) return;
-  ok(res, { settings: getSettings() });
+  ok(res, { settings: await getSettings() });
 });
 route('PUT', '/api/settings', async (req, res) => {
-  const user = auth(req, res, ['admin']);
+  const user = await auth(req, res, ['admin']);
   if (!user) return;
   const body = await readBody(req);
-  const current = getSettings();
+  const current = await getSettings();
   for (const [group, values] of Object.entries(body)) {
     if (!current[group] || typeof values !== 'object' || values === null) continue;
     const merged = { ...current[group], ...values };
-    db.prepare('UPDATE settings SET value=? WHERE key=?').run(JSON.stringify(merged), group);
+    await db.prepare('UPDATE settings SET value=? WHERE key=?').run(JSON.stringify(merged), group);
   }
-  ok(res, { settings: getSettings() });
+  ok(res, { settings: await getSettings() });
 });
 
 // ---- CSV templates ----
-route('GET', '/api/templates/students.csv', (req, res) => {
-  const user = auth(req, res, null);
+route('GET', '/api/templates/students.csv', async (req, res) => {
+  const user = await auth(req, res, null);
   if (!user) return;
   const csv = toCSV([
     ['Admission No', 'Name', 'Class', 'Section', 'Roll No', 'Gender', 'DOB', 'Blood Group', 'Religion', 'Category', 'Caste', 'Address', 'Father Name', 'Mother Name', 'Guardian Name', 'Occupation', 'Mobile 1', 'Mobile 2', 'Aadhaar No', 'PEN', 'Admission Date'],
@@ -1445,8 +1448,8 @@ route('GET', '/api/templates/students.csv', (req, res) => {
   res.writeHead(200, { 'Content-Type': 'text/csv', 'Content-Disposition': 'attachment; filename="students_template.csv"' });
   res.end(csv);
 });
-route('GET', '/api/templates/employees.csv', (req, res) => {
-  const user = auth(req, res, null);
+route('GET', '/api/templates/employees.csv', async (req, res) => {
+  const user = await auth(req, res, null);
   if (!user) return;
   const csv = toCSV([
     ['Code', 'Name', 'Type', 'Designation', 'Department', 'Phone', 'Email', 'Salary', 'Join Date'],
@@ -1455,8 +1458,8 @@ route('GET', '/api/templates/employees.csv', (req, res) => {
   res.writeHead(200, { 'Content-Type': 'text/csv', 'Content-Disposition': 'attachment; filename="employees_template.csv"' });
   res.end(csv);
 });
-route('GET', '/api/templates/users.csv', (req, res) => {
-  const user = auth(req, res, null);
+route('GET', '/api/templates/users.csv', async (req, res) => {
+  const user = await auth(req, res, null);
   if (!user) return;
   const csv = toCSV([
     ['Username', 'Role', 'Linked Type', 'Linked Code'],
@@ -1468,13 +1471,13 @@ route('GET', '/api/templates/users.csv', (req, res) => {
 });
 
 // ---- misc helpers ----
-function linkedName(user) {
+async function linkedName(user) {
   if (user.linked_type === 'employee') {
-    const e = db.prepare('SELECT name, designation FROM employees WHERE id=?').get(user.linked_id);
+    const e = await db.prepare('SELECT name, designation FROM employees WHERE id=?').get(user.linked_id);
     return e ? `${e.name}${e.designation ? ' — ' + e.designation : ''}` : '';
   }
   if (user.linked_type === 'parent') {
-    const p = db.prepare('SELECT name FROM parents WHERE id=?').get(user.linked_id);
+    const p = await db.prepare('SELECT name FROM parents WHERE id=?').get(user.linked_id);
     return p ? p.name : '';
   }
   return '';
@@ -1511,6 +1514,7 @@ function serveStatic(req, res, pathname) {
 // Request handler shared by the local HTTP server AND the Vercel serverless
 // function (api/index.js). Vercel calls it with the same (req, res) pair.
 async function handleRequest(req, res) {
+  await ensureDb();
   const pathname = req.url.split('?')[0];
   try {
     if (pathname.startsWith('/api/')) {
@@ -1545,8 +1549,9 @@ const server = http.createServer(handleRequest);
 // Only bind the port when run directly (node server.js). When imported as a
 // module (e.g. by the Vercel serverless function) the handler is exported instead.
 if (require.main === module) {
-  server.listen(PORT, () => {
-    const s = getSettings();
+  server.listen(PORT, async () => {
+    await ensureDb();
+    const s = await getSettings();
     console.log(`\n🏫 ${s.school.name} — School Management System`);
     console.log(`   http://localhost:${PORT}`);
     console.log(`   Admin:  admin / admin@123`);

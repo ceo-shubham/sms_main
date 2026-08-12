@@ -1,6 +1,7 @@
-// backup.js — automatic CSV backups organised as backups/YYYY-MM-DD/<module>/
-// A module's folder and file are created ONLY when there is actual data / activity
-// for that module — no empty folders, no files for untouched modules.
+// backup.js — automatic CSV backups organised as backups/YYYY-MM-DD/<module>/,
+// pushed to Backblaze B2 (10 GB free bucket) when B2 credentials are set.
+// A module's folder and file are created ONLY when there is actual data /
+// activity for that module — no empty folders, no files for untouched modules.
 'use strict';
 const fs = require('node:fs');
 const path = require('node:path');
@@ -17,7 +18,7 @@ function todayStr() {
 
 function esc(v) {
   const s = v == null ? '' : String(v);
-  return /[\",\n]/.test(s) ? '"' + s.replace(/"/g, '""') + '"' : s;
+  return /[",\n]/.test(s) ? '"' + s.replace(/"/g, '""') + '"' : s;
 }
 function toCSV(header, rows) {
   return [header, ...rows.map(r => header.map(h => esc(r[h])))]
@@ -84,32 +85,89 @@ const CATEGORIES = [
 ];
 
 // Build the CSV for one table; returns null when there is nothing to back up.
-function dumpTable(db, spec) {
+async function dumpTable(db, spec) {
   if (spec.mode === 'today') {
-    const rows = db.prepare(spec.sql).all(todayStr());
+    const rows = await db.prepare(spec.sql).all(todayStr());
     if (!rows.length) return null; // no activity on this date → no file/folder
     return toCSV(spec.header, rows);
   }
-  const rows = db.prepare(`SELECT * FROM ${spec.name}`).all();
+  const rows = await db.prepare(`SELECT * FROM ${spec.name}`).all();
   if (!rows.length) return null; // table is empty → no file/folder
   return toCSV(Object.keys(rows[0]), rows);
+}
+
+// ---------------------------------------------------------------------------
+// Backblaze B2 upload (native B2 API — no SDK needed).
+// Files land in the bucket under backups/<day>/...
+// ---------------------------------------------------------------------------
+async function uploadToB2(day, files) {
+  const keyId = process.env.B2_KEY_ID;
+  const appKey = process.env.B2_APP_KEY;
+  const bucket = process.env.B2_BUCKET;
+  if (!keyId || !appKey || !bucket || !files.length) return 0;
+
+  const authRes = await fetch('https://api.backblazeb2.com/b2api/v3/b2_authorize_account', {
+    headers: { Authorization: 'Basic ' + Buffer.from(keyId + ':' + appKey).toString('base64') }
+  });
+  const auth = await authRes.json();
+  if (auth.code) { console.error('☁️ B2 auth failed:', auth.message); return 0; }
+  const token = auth.authorizationToken;
+  const apiUrl = (auth.apiInfo && auth.apiInfo.storageApi && auth.apiInfo.storageApi.apiUrl) || auth.apiUrl;
+
+  const listRes = await fetch(apiUrl + '/b2api/v3/b2_list_buckets', {
+    method: 'POST',
+    headers: { Authorization: token, 'Content-Type': 'application/json' },
+    body: JSON.stringify({ accountId: auth.accountId })
+  });
+  const list = await listRes.json();
+  const b = (list.buckets || []).find(x => x.bucketName === bucket);
+  if (!b) { console.error('☁️ B2 bucket not found:', bucket); return 0; }
+
+  let uploaded = 0;
+  for (const file of files) {
+    try {
+      const upRes = await fetch(apiUrl + '/b2api/v3/b2_get_upload_url', {
+        method: 'POST',
+        headers: { Authorization: token, 'Content-Type': 'application/json' },
+        body: JSON.stringify({ bucketId: b.bucketId })
+      });
+      const up = await upRes.json();
+      if (up.code) continue;
+      const data = fs.readFileSync(file.path);
+      const put = await fetch(up.uploadUrl, {
+        method: 'POST',
+        headers: {
+          Authorization: up.authorizationToken,
+          'X-Bz-File-Name': encodeURIComponent('backups/' + file.relative),
+          'Content-Type': 'text/csv',
+          'Content-Length': String(data.length),
+          'X-Bz-Content-Sha1': crypto.createHash('sha1').update(data).digest('hex')
+        },
+        body: data
+      });
+      if (put.ok) uploaded++;
+    } catch (e) { /* keep going on a per-file failure */ }
+  }
+  if (uploaded) console.log(`☁️  B2: ${uploaded} backup file(s) uploaded → ${bucket}/backups/${day}/`);
+  return uploaded;
 }
 
 const lastHash = {}; // table name -> sha1 of the last CSV actually written
 
 // Write CSVs into backups/YYYY-MM-DD/<module>/ — only for modules that have data
-// and only when that data changed since the last backup.
-function writeBackups(db) {
+// and only when that data changed since the last backup. Then push to B2.
+async function writeBackups(db) {
   const day = todayStr();
   const dayDir = path.join(BACKUP_ROOT, day);
   const now = new Date();
   const stamp = `${pad(now.getHours())}-${pad(now.getMinutes())}-${pad(now.getSeconds())}`;
   let wrote = 0;
+  const newFiles = [];
 
   for (const cat of CATEGORIES) {
     for (const spec of cat.tables) {
       let csv;
-      try { csv = dumpTable(db, spec); } catch (e) { continue; } // table missing / query failed
+      try { csv = await dumpTable(db, spec); } catch (e) { continue; } // table missing / query failed
       if (csv == null) continue;
       const hash = crypto.createHash('sha1').update(csv).digest('hex');
       if (lastHash[spec.name] === hash) continue; // unchanged since last backup
@@ -119,6 +177,7 @@ function writeBackups(db) {
       fs.writeFileSync(file, csv, 'utf8');
       lastHash[spec.name] = hash;
       wrote++;
+      newFiles.push({ path: file, relative: path.join(day, cat.folder, `${spec.name}_${stamp}.csv`) });
     }
   }
 
@@ -131,19 +190,22 @@ function writeBackups(db) {
       const files = fs.readdirSync(dir).filter(f => f.endsWith('.csv')).sort();
       if (files.length) index.categories[cat.folder] = files;
     }
-    fs.writeFileSync(path.join(dayDir, 'index.json'), JSON.stringify(index, null, 2), 'utf8');
+    const indexFile = path.join(dayDir, 'index.json');
+    fs.writeFileSync(indexFile, JSON.stringify(index, null, 2), 'utf8');
+    newFiles.push({ path: indexFile, relative: path.join(day, 'index.json') });
     console.log(`💾 Backup written → backups/${day}/ (${wrote} file${wrote === 1 ? '' : 's'} changed)`);
   }
+
+  try { await uploadToB2(day, newFiles); } catch (e) { console.error('☁️ B2 upload error:', e.message); }
   return wrote > 0;
 }
 
 function startAutoBackup(db, intervalMs) {
-  writeBackups(db);
-  const timer = setInterval(() => {
-    try { writeBackups(db); } catch (e) { console.error('Backup error:', e.message); }
-  }, intervalMs || 60000);
+  const run = async () => { try { await writeBackups(db); } catch (e) { console.error('Backup error:', e.message); } };
+  run();
+  const timer = setInterval(run, intervalMs || 60000);
   timer.unref && timer.unref();
   return timer;
 }
 
-module.exports = { writeBackups, startAutoBackup, BACKUP_ROOT };
+module.exports = { writeBackups, startAutoBackup, uploadToB2, BACKUP_ROOT };

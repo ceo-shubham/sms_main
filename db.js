@@ -241,12 +241,41 @@ function migrate(db) {
 }
 
 function initDb() {
-  const db = new DatabaseSync(DB_PATH);
-  db.exec('PRAGMA journal_mode = WAL;');
-  db.exec(SCHEMA);
-  migrate(db);
-  seedIfEmpty(db);
-  return db;
+  const sqlite = new DatabaseSync(DB_PATH);
+  sqlite.exec('PRAGMA journal_mode = WAL;');
+  sqlite.exec(SCHEMA);
+  migrate(sqlite);
+  seedIfEmpty(sqlite);
+  // Async facade — same shape as the Turso backend below, so server.js is
+  // identical on both (always `await db.prepare(...).get/all/run`).
+  return {
+    backend: 'sqlite',
+    prepare(sql) {
+      const stmt = sqlite.prepare(sql);
+      return {
+        get: async (...args) => stmt.get(...args),
+        all: async (...args) => stmt.all(...args),
+        run: async (...args) => {
+          const r = stmt.run(...args);
+          return { changes: Number(r.changes), lastInsertRowid: Number(r.lastInsertRowid) };
+        }
+      };
+    },
+    exec: async (sql) => { sqlite.exec(sql); },
+    async batch(statements) {
+      sqlite.exec('BEGIN');
+      try {
+        let last = { changes: 0, lastInsertRowid: 0 };
+        for (const s of statements) {
+          const r = sqlite.prepare(s.sql).run(...(s.args || []));
+          last = { changes: Number(r.changes), lastInsertRowid: Number(r.lastInsertRowid) };
+        }
+        sqlite.exec('COMMIT');
+        return last;
+      } catch (e) { sqlite.exec('ROLLBACK'); throw e; }
+    },
+    close: () => sqlite.close()
+  };
 }
 
 // Minimal bootstrap: no demo/fake data — just the two primary accounts.
@@ -329,4 +358,57 @@ async function seedMongo(store) {
   console.log('🌱 Mongo database seeded (admin / admin@123, manager / manager@123)');
 }
 
-module.exports = { initDb, initMongo, seedMongo, hashPassword, verifyPassword, DEFAULT_SETTINGS, DB_PATH, MONGO_DB_NAME };
+// ---------------------------------------------------------------------------
+// Turso (serverless libSQL) backend — used on Vercel where SQLite's local file
+// can't persist. Same SQL, same schema, same async facade as the SQLite path.
+// ---------------------------------------------------------------------------
+async function bootstrapDb(db) {
+  await db.exec(SCHEMA);
+  const row = await db.prepare('SELECT COUNT(*) AS c FROM settings').get();
+  if (row && row.c > 0) return;
+  const ins = (sql, ...args) => db.prepare(sql).run(...args);
+  for (const [k, v] of Object.entries(DEFAULT_SETTINGS)) await ins('INSERT INTO settings (key, value) VALUES (?, ?)', k, JSON.stringify(v));
+  await ins("INSERT INTO users (username,password_hash,role,status,force_password_change) VALUES ('admin',?, 'admin', 'active', 0)", hashPassword('admin@123'));
+  await ins("INSERT INTO users (username,password_hash,role,status,force_password_change) VALUES ('manager',?, 'manager', 'active', 0)", hashPassword('manager@123'));
+  console.log('✅ Fresh database seeded (admin / admin@123, manager / manager@123)');
+}
+
+function initTurso({ url, authToken }) {
+  const { createClient } = require('@libsql/client');
+  const client = createClient({ url, authToken });
+  return {
+    backend: 'turso',
+    prepare(sql) {
+      return {
+        get: async (...args) => (await client.execute({ sql, args })).rows[0],
+        all: async (...args) => (await client.execute({ sql, args })).rows,
+        run: async (...args) => {
+          const r = await client.execute({ sql, args });
+          return { changes: Number(r.rowsAffected ?? 0), lastInsertRowid: Number(r.lastInsertRowid ?? 0) };
+        }
+      };
+    },
+    exec: async (sql) => { await client.executeMultiple(sql); },
+    async batch(statements) {
+      const results = await client.batch(statements.map(s => ({ sql: s.sql, args: s.args || [] })), 'write');
+      const last = results && results.length ? results[results.length - 1] : null;
+      return { changes: Number(last ? last.rowsAffected : 0), lastInsertRowid: Number(last ? (last.lastInsertRowid ?? 0) : 0) };
+    },
+    close: async () => {}
+  };
+}
+
+// Pick the backend: Turso when TURSO_URL is set (Vercel/production), otherwise
+// the local SQLite file (dev). Both return the same async facade.
+async function createDb() {
+  if (process.env.TURSO_URL) {
+    const db = initTurso({ url: process.env.TURSO_URL, authToken: process.env.TURSO_AUTH_TOKEN });
+    await bootstrapDb(db);
+    return db;
+  }
+  const db = initDb();
+  await bootstrapDb(db);
+  return db;
+}
+
+module.exports = { initDb, initTurso, createDb, bootstrapDb, SCHEMA, initMongo, seedMongo, hashPassword, verifyPassword, DEFAULT_SETTINGS, DB_PATH, MONGO_DB_NAME };

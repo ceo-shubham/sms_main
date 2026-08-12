@@ -11,6 +11,7 @@
     "dev": "node --env-file=.env server.js"
   },
   "dependencies": {
+    "@libsql/client": "^0.14.0",
     "mongodb": "^6.10.0"
   }
 }
